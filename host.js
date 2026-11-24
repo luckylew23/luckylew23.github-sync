@@ -269,6 +269,19 @@ class GitHub {
     );
   }
 
+  // Write one file through the contents API, which also creates the branch
+  // and the first commit when the repository has none. Each path segment is
+  // encoded: a file name may hold '#', '?' or a space.
+  async putFile(rel, bytes, message, branch, signal) {
+    const path = rel.split("/").map(encodeURIComponent).join("/");
+    return this.request(
+      "PUT",
+      "/repos/" + this.owner + "/" + this.repo + "/contents/" + path,
+      { message, content: bytesToBase64(bytes), branch },
+      signal,
+    );
+  }
+
   async getBlob(sha, signal) {
     const data = await this.request(
       "GET",
@@ -379,32 +392,43 @@ async function pullFiles(gh, remote, toPull, root, signal, report) {
 }
 
 async function pushFiles(gh, config, local, remote, toPush, head, root, signal, report) {
-  // Create the blobs for changed and added files; deletions are marked by
-  // a null sha in the tree. Every entry is expressed relative to the
-  // current remote tree, so unchanged files are carried over untouched.
+  // A repository with no commits rejects the whole Git Data API with
+  // "Git Repository is empty", so the first file goes through the contents
+  // API: that creates the branch and the initial commit for us. Every
+  // later file travels the normal way, in one commit.
+  let pending = toPush;
+  if (!head) {
+    const first = pending.find((change) => local.get(change.rel) !== undefined);
+    if (!first) return null; // only deletions, and there is nothing to delete
+    report && report(0, "uploading " + first.rel);
+    const bytes = await textus.files.read(root + "/" + first.rel);
+    await gh.putFile(first.rel, bytes, "Sync from Textus", config.branch, signal);
+    head = await gh.branchHead(config.branch, signal);
+    if (!head) throw new ApiError(500, "the new branch did not appear", "server");
+    pending = pending.filter((change) => change !== first);
+  }
+  if (!pending.length) return head.commit;
+
+  // Create blobs for changed and added files; deletions are a null sha in
+  // the tree. Every entry is relative to the current remote tree, so the
+  // files we did not touch carry over unchanged.
   const entries = [];
   let n = 0;
-  for (const { rel } of toPush) {
+  for (const { rel } of pending) {
     const localSha = local.get(rel);
     if (localSha === undefined) {
       // Deleted locally: remove from the remote tree.
       entries.push({ path: rel, mode: "100644", type: "blob", sha: null });
     } else {
-      report && report(n++ / toPush.length, "uploading " + rel);
+      report && report(n++ / pending.length, "uploading " + rel);
       const bytes = await textus.files.read(root + "/" + rel);
       const sha = await gh.createBlob(bytes, signal);
       entries.push({ path: rel, mode: "100644", type: "blob", sha });
     }
   }
   report && report(1, "committing");
-  const tree = await gh.createTree(head ? head.tree : undefined, entries, signal);
-  const parents = head ? [head.commit] : [];
-  const commit = await gh.createCommit(
-    "Sync from Textus",
-    tree,
-    parents,
-    signal,
-  );
+  const tree = await gh.createTree(head.tree, entries, signal);
+  const commit = await gh.createCommit("Sync from Textus", tree, [head.commit], signal);
   await gh.updateRef(config.branch, commit, signal);
   return commit;
 }
@@ -429,7 +453,12 @@ async function synchronize(gh, config, base, root, signal, report, mode) {
   // 3. Three-way diff against the recorded base.
   const baseShas = (base && base.fileShas) || {};
   const { toPush, toPull, conflicts } = diff(local, remote, baseShas);
-  if (conflicts.length) return { conflicts, head, remote, local };
+  // A conflict stops the sync before anything moves, but the result keeps
+  // the same shape as a completed one: the panel and the Controller read
+  // pushed, pulled and fileShas without asking which outcome it was.
+  if (conflicts.length) {
+    return { conflicts, head, remote, local, fileShas: baseShas, pushed: 0, pulled: 0 };
+  }
 
   // 4. Pull the remote-only side (unless we were asked to push only).
   const pulled = [];
@@ -458,7 +487,7 @@ async function synchronize(gh, config, base, root, signal, report, mode) {
           signal,
           report,
         );
-        pushedCount = toPush.length;
+        pushedCount = newCommit ? toPush.length : 0;
         break;
       } catch (e) {
         // Someone else pushed while we worked; re-read and retry.

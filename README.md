@@ -49,7 +49,9 @@ repository and settings live per folder in `.textus/plugins/`.
 
 Everything in the open folder except: folders whose name starts with a dot
 (`.textus`, `.git`, …), anything matched by the folder's `.gitignore`, and
-files over 10 MB.
+files over 10 MB. The `.gitignore` itself is an ordinary file here: it is
+synced too, so ignore rules travel with the notes and apply on every
+machine.
 
 ## Limitations
 
@@ -57,6 +59,12 @@ files over 10 MB.
   github.com for that.
 - One branch per folder; merges across branches are out of scope.
 - A 10 MB cap per file keeps a stray video from dominating a sync.
+- A repository cannot be emptied: GitHub rejects a commit whose tree has
+  no files at all, so deleting the last file in the folder reports an
+  error and keeps it on GitHub. Delete it on github.com in that case.
+- A brand-new repository works: its first commit is made through the
+  contents API, since GitHub refuses the git-data endpoints on a
+  repository with no commits.
 
 ## License
 

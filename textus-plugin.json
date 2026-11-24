@@ -1,6 +1,6 @@
 {
   "id": "luckylew23.github-sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "engines": { "textus": ">=1.4.3" },
   "platforms": ["desktop"],
   "main": "host.js",
