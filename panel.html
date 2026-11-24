@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <!-- The panel is one screen per phase: setup (token → repo → branch),
+       first-choice (both sides have content), and the main sync view.
+       Textus applies its theme variables to the page, so every colour,
+       radius and font comes from them. -->
+  <main id="app">
+
+    <section id="setup" hidden>
+      <h1 id="setup-title"></h1>
+
+      <div class="step" id="step-token">
+        <label for="token" id="token-label"></label>
+        <input id="token" type="password" autocomplete="off" spellcheck="false">
+        <p class="hint" id="token-hint"></p>
+        <button id="connect" class="primary"></button>
+        <p class="error" id="token-error" hidden></p>
+      </div>
+
+      <div class="step" id="step-repo" hidden>
+        <label for="repo-input" id="repo-label"></label>
+        <input id="repo-input" spellcheck="false">
+        <div id="repo-list" class="pick-list" hidden></div>
+        <label for="branch-input" id="branch-label"></label>
+        <input id="branch-input" spellcheck="false">
+        <button id="finish" class="primary"></button>
+        <p class="error" id="repo-error" hidden></p>
+      </div>
+    </section>
+
+    <section id="first" hidden>
+      <h1 id="first-title"></h1>
+      <div class="choices">
+        <button id="first-push" class="primary"></button>
+        <button id="first-pull"></button>
+        <button id="first-cancel" class="quiet"></button>
+      </div>
+    </section>
+
+    <section id="main" hidden>
+      <header>
+        <h1 id="repo-name"></h1>
+        <p class="hint" id="last-sync"></p>
+      </header>
+
+      <p id="message" hidden></p>
+      <div id="progress" class="progress" hidden><div id="progress-bar"></div></div>
+      <p class="error" id="main-error" hidden></p>
+
+      <div id="conflicts" hidden>
+        <h2 id="conflicts-title"></h2>
+        <ul id="conflict-list"></ul>
+      </div>
+
+      <div class="actions">
+        <button id="sync" class="primary"></button>
+        <button id="push"></button>
+        <button id="pull"></button>
+      </div>
+
+      <details id="settings">
+        <summary id="settings-title"></summary>
+        <label class="check"><input type="checkbox" id="auto-push"> <span id="auto-push-label"></span></label>
+        <label class="check"><input type="checkbox" id="auto-pull"> <span id="auto-pull-label"></span></label>
+        <button id="disconnect" class="quiet"></button>
+      </details>
+    </section>
+
+  </main>
+  <script src="panel.js"></script>
+</body>
+</html>

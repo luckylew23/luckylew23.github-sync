@@ -1,0 +1,5 @@
+# Plugin data lives here, not in the repo.
+.textus/
+# OS files.
+.DS_Store
+Thumbs.db
