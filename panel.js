@@ -32,11 +32,39 @@ function applyL10n() {
   $("sync").textContent = t("action.sync");
   $("push").textContent = t("action.push");
   $("pull").textContent = t("action.pull");
+  $("commit-message").placeholder = t("commit.placeholder");
+  $("bound").textContent = t("platform.github");
+  $("save-settings").textContent = t("action.saveSettings");
   $("disconnect").textContent = t("action.disconnect");
   $("conflicts-title").textContent = t("conflict.title");
   $("settings-title").textContent = t("action.settings");
   $("auto-push-label").textContent = t("settings.autoPush");
+  $("auto-push-hint").textContent = t("settings.autoPush.hint");
   $("auto-pull-label").textContent = t("settings.autoPull");
+  $("auto-pull-hint").textContent = t("settings.autoPull.hint");
+  $("auto-sync-on-open-label").textContent = t("settings.autoSyncOnOpen");
+  $("pull-minutes-label").textContent = t("settings.autoPullEvery");
+  $("sync-mode-label").textContent = t("settings.syncMode");
+  $("conflict-policy-label").textContent = t("settings.conflictPolicy");
+  $("exclude-label").textContent = t("settings.exclude");
+  $("exclude-hint").textContent = t("settings.exclude.hint");
+  $("max-size-label").textContent = t("settings.maxSize");
+  for (const [id, keys] of [
+    ["pull-minutes", [5, 10, 15, 30, 60]],
+    ["sync-mode", ["both", "push", "pull"]],
+    ["conflict-policy", ["ask", "local", "remote", "both"]],
+  ]) {
+    const select = $(id);
+    select.textContent = "";
+    for (const key of keys) {
+      const option = document.createElement("option");
+      option.value = key;
+      option.textContent = typeof key === "number"
+        ? api.t("settings.minutes", key)
+        : api.t("settings." + id.replace(/-/g, "") + "." + key);
+      select.append(option);
+    }
+  }
 }
 
 // --- phases -------------------------------------------------------------
@@ -68,11 +96,12 @@ function render(state) {
 
 function renderStatus(state) {
   const last = $("last-sync");
-  if (state.lastSync) {
-    last.textContent = api.t("sync.last", new Date(state.lastSync).toLocaleString());
-  } else {
-    last.textContent = api.t("sync.never");
-  }
+  const pushed = state.lastPush ? api.t("sync.last", new Date(state.lastPush).toLocaleString()) : "";
+  const pulled = state.lastPull ? api.t("sync.last", new Date(state.lastPull).toLocaleString()) : "";
+  last.textContent = [
+    api.t("sync.lastPush") + " " + (pushed || api.t("sync.never")),
+    api.t("sync.lastPull") + " " + (pulled || api.t("sync.never")),
+  ].join("   ");
   const bits = [];
   if (state.ahead) bits.push(api.t("sync.ahead", state.ahead));
   if (state.behind) bits.push(api.t("sync.behind", state.behind));
@@ -130,6 +159,15 @@ function renderSettings(state) {
   const config = state.config || {};
   $("auto-push").checked = config.autoPush !== false;
   $("auto-pull").checked = config.autoPull !== false;
+  $("auto-sync-on-open").checked = config.autoSyncOnOpen === true;
+  $("pull-minutes").value = String(config.autoPullMinutes || 5);
+  $("sync-mode").value = config.syncMode || "both";
+  $("conflict-policy").value = config.conflictPolicy || "ask";
+  $("exclude").value = (config.exclude || []).join("\n");
+  $("max-size").value = String(Math.round((config.maxFileSize || 10 * 1024 * 1024) / (1024 * 1024)));
+  if (document.activeElement !== $("commit-message")) {
+    $("commit-message").value = config.commitMessage || "";
+  }
 }
 
 function button(label, onClick) {
@@ -140,9 +178,15 @@ function button(label, onClick) {
 }
 
 function setBusy(busy) {
-  for (const id of ["sync", "push", "pull", "connect", "finish"]) {
+  for (const id of ["sync", "push", "pull", "connect", "finish", "save-settings"]) {
     $(id).disabled = busy;
   }
+}
+
+// The commit line travels with the button press, so the click can never
+// race a separate settings save that has not reached the host yet.
+function syncMessage(type) {
+  return { type, commitMessage: $("commit-message").value.trim() };
 }
 
 // --- events -------------------------------------------------------------
@@ -192,15 +236,25 @@ $("repo-input").addEventListener("input", () => {
   }
 });
 
-$("sync").addEventListener("click", () => api.postMessage({ type: "sync" }));
-$("push").addEventListener("click", () => api.postMessage({ type: "push" }));
-$("pull").addEventListener("click", () => api.postMessage({ type: "pull" }));
+$("sync").addEventListener("click", () => api.postMessage(syncMessage("sync")));
+$("push").addEventListener("click", () => api.postMessage(syncMessage("push")));
+$("pull").addEventListener("click", () => api.postMessage(syncMessage("pull")));
 $("first-push").addEventListener("click", () => api.postMessage({ type: "firstSync", choice: "push" }));
 $("first-pull").addEventListener("click", () => api.postMessage({ type: "firstSync", choice: "pull" }));
 $("first-cancel").addEventListener("click", () => api.postMessage({ type: "setupCancel" }));
 $("disconnect").addEventListener("click", () => api.postMessage({ type: "disconnect" }));
-$("auto-push").addEventListener("change", () => api.postMessage({ type: "settings", autoPush: $("auto-push").checked }));
-$("auto-pull").addEventListener("change", () => api.postMessage({ type: "settings", autoPull: $("auto-pull").checked }));
+$("save-settings").addEventListener("click", () => api.postMessage({
+  type: "settings",
+  autoPush: $("auto-push").checked,
+  autoPull: $("auto-pull").checked,
+  autoSyncOnOpen: $("auto-sync-on-open").checked,
+  autoPullMinutes: Number($("pull-minutes").value) || 5,
+  syncMode: $("sync-mode").value,
+  conflictPolicy: $("conflict-policy").value,
+  exclude: $("exclude").value.split(/[\n,]/).map((s) => s.trim()).filter(Boolean),
+  maxFileSize: (Number($("max-size").value) || 10) * 1024 * 1024,
+  commitMessage: $("commit-message").value.trim(),
+}));
 
 function resolve_(rel, choice) {
   api.postMessage({ type: "resolveConflict", rel, choice });

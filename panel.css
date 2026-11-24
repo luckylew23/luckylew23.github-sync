@@ -36,6 +36,9 @@ label {
 
 input[type="text"],
 input[type="password"],
+input[type="number"],
+textarea,
+select,
 input:not([type]) {
   width: 100%;
   box-sizing: border-box;
@@ -171,5 +174,24 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 6px;
+  margin-top: 8px;
+}
+
+#settings label:not(.check),
+#settings input,
+#settings select,
+#settings textarea {
+  margin-top: 8px;
+}
+
+#settings .hint {
+  margin-top: 2px;
+}
+
+#save-settings {
+  margin-top: var(--gap);
+}
+
+#disconnect {
   margin-top: 8px;
 }

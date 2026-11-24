@@ -298,9 +298,14 @@ class GitHub {
 // ---------------------------------------------------------------------------
 
 // Returns [{ rel, path, size }] for every file to sync: not a dot-folder,
-// not matched by .gitignore, and under the size cap.
-async function scanFiles(root, gitignore, maxSize, signal) {
-  const patterns = gitignore ? parseGitignore(gitignore) : [];
+// not matched by .gitignore or the settings' exclude patterns, and under
+// the size cap. Extra patterns are comma- or newline-separated globs with
+// the same matching rules as .gitignore lines.
+async function scanFiles(root, gitignore, maxSize, signal, extra) {
+  const patterns = [
+    ...(gitignore ? parseGitignore(gitignore) : []),
+    ...parseGitignore((extra || []).join("\n")),
+  ];
   const out = [];
   async function walk(dir) {
     const entries = await textus.files.list(dir);
@@ -391,6 +396,13 @@ async function pullFiles(gh, remote, toPull, root, signal, report) {
   return done;
 }
 
+// The commit message is the user's own line when there is one; otherwise
+// Textus names the sync so the history still says what made the change.
+function commitMessage(config) {
+  const custom = config && config.commitMessage && config.commitMessage.trim();
+  return custom || "Sync from Textus";
+}
+
 async function pushFiles(gh, config, local, remote, toPush, head, root, signal, report) {
   // A repository with no commits rejects the whole Git Data API with
   // "Git Repository is empty", so the first file goes through the contents
@@ -402,7 +414,7 @@ async function pushFiles(gh, config, local, remote, toPush, head, root, signal, 
     if (!first) return null; // only deletions, and there is nothing to delete
     report && report(0, "uploading " + first.rel);
     const bytes = await textus.files.read(root + "/" + first.rel);
-    await gh.putFile(first.rel, bytes, "Sync from Textus", config.branch, signal);
+    await gh.putFile(first.rel, bytes, commitMessage(config), config.branch, signal);
     head = await gh.branchHead(config.branch, signal);
     if (!head) throw new ApiError(500, "the new branch did not appear", "server");
     pending = pending.filter((change) => change !== first);
@@ -428,7 +440,7 @@ async function pushFiles(gh, config, local, remote, toPush, head, root, signal, 
   }
   report && report(1, "committing");
   const tree = await gh.createTree(head.tree, entries, signal);
-  const commit = await gh.createCommit("Sync from Textus", tree, [head.commit], signal);
+  const commit = await gh.createCommit(commitMessage(config), tree, [head.commit], signal);
   await gh.updateRef(config.branch, commit, signal);
   return commit;
 }
@@ -442,7 +454,7 @@ async function synchronize(gh, config, base, root, signal, report, mode) {
 
   // 2. Local state: scan, then hash every file.
   const gitignore = await readGitignore(root);
-  const files = await scanFiles(root, gitignore, config.maxFileSize || MAX_FILE_SIZE, signal);
+  const files = await scanFiles(root, gitignore, config.maxFileSize || MAX_FILE_SIZE, signal, config.exclude);
   const local = new Map();
   for (const f of files) {
     if (signal && signal.aborted) throw new DOMException("aborted", "AbortError");
@@ -587,9 +599,16 @@ class Controller {
     subs.push(textus.files.onDidChangeRoot(() => this.refresh()));
 
     // Steady-state auto-pull.
-    this.pullTimer = setInterval(() => this.autoPull(), DEFAULT_PULL_MINUTES * 60000);
+    this.restartPullTimer();
 
     await this.refresh();
+  }
+
+  // The interval is a setting; saving a new value restarts the timer.
+  restartPullTimer() {
+    if (this.pullTimer) clearInterval(this.pullTimer);
+    const minutes = (this.state.config && this.state.config.autoPullMinutes) || DEFAULT_PULL_MINUTES;
+    this.pullTimer = setInterval(() => this.autoPull(), minutes * 60000);
   }
 
   async refresh() {
@@ -620,7 +639,7 @@ class Controller {
       const head = await gh.branchHead(config.branch);
       const remote = head ? await gh.treeBlobs(head.tree) : new Map();
       const gitignore = await readGitignore(root);
-      const files = await scanFiles(root, gitignore, config.maxFileSize || MAX_FILE_SIZE);
+      const files = await scanFiles(root, gitignore, config.maxFileSize || MAX_FILE_SIZE, null, config.exclude);
       const local = new Map();
       for (const f of files) {
         const bytes = await textus.files.read(f.path);
@@ -653,6 +672,15 @@ class Controller {
       if (i >= 0) this.views.splice(i, 1);
     });
     this.broadcast();
+    // Opening the panel is the "click the icon to sync" gesture: refresh
+    // the ahead/behind counts, and run a full sync when the setting asks.
+    if (this.state.configured) {
+      if (this.state.config.autoSyncOnOpen && !this.busy) {
+        await this.runSync();
+      } else {
+        await this.countChanges();
+      }
+    }
   }
 
   open() {
@@ -695,13 +723,13 @@ class Controller {
         await this.setup(msg.owner, msg.repo, msg.branch);
         break;
       case "sync":
-        await this.runSync();
+        await this.runSync(null, msg);
         break;
       case "push":
-        await this.runSync("push");
+        await this.runSync("push", msg);
         break;
       case "pull":
-        await this.runSync("pull");
+        await this.runSync("pull", msg);
         break;
       case "resolveConflict":
         await this.resolveConflict(msg.rel, msg.choice);
@@ -779,7 +807,12 @@ class Controller {
       autoPush: true,
       autoPull: true,
       autoPullMinutes: DEFAULT_PULL_MINUTES,
+      autoSyncOnOpen: false,
+      settleSeconds: 5,
+      syncMode: "both",
+      conflictPolicy: "ask",
       maxFileSize: MAX_FILE_SIZE,
+      exclude: [],
     };
     await this.ctx.storage.project.set("config", config);
     this.state.config = config;
@@ -792,7 +825,7 @@ class Controller {
     const head = await gh.branchHead(config.branch).catch(() => null);
     const remote = head ? await gh.treeBlobs(head.tree).catch(() => new Map()) : new Map();
     const gitignore = await readGitignore(root);
-    const files = await scanFiles(root, gitignore, config.maxFileSize);
+    const files = await scanFiles(root, gitignore, config.maxFileSize, null, config.exclude);
     const hasLocal = files.length > 0;
     const hasRemote = remote.size > 0;
 
@@ -810,6 +843,7 @@ class Controller {
     await this.ctx.storage.project.set("config", config);
     this.state.config = config;
     this.broadcast();
+    this.restartPullTimer();
     await this.countChanges();
   }
 
@@ -825,7 +859,7 @@ class Controller {
       const head = await gh.branchHead(config.branch);
       const remote = head ? await gh.treeBlobs(head.tree) : new Map();
       const gitignore = await readGitignore(root);
-      const files = await scanFiles(root, gitignore, config.maxFileSize);
+      const files = await scanFiles(root, gitignore, config.maxFileSize, null, config.exclude);
       const local = new Map();
       for (const f of files) {
         local.set(f.rel, await blobSha(await textus.files.read(f.path)));
@@ -854,7 +888,7 @@ class Controller {
     }
   }
 
-  async runSync(mode) {
+  async runSync(mode, extra) {
     if (this.busy) return;
     this.busy = true;
     this.abort = new AbortController();
@@ -865,6 +899,18 @@ class Controller {
       if (!config) {
         this.broadcast({ syncing: false, error: this.t("state.disconnected") });
         return;
+      }
+      // The commit line from the panel rides on the sync message; the
+      // settings' own line still wins until the next sync overrides it.
+      if (extra && typeof extra.commitMessage === "string") {
+        config.commitMessage = extra.commitMessage;
+      }
+      // The panel's direction policy decides when no side was named: "both"
+      // is the plain two-way sync, the others pin it to one direction.
+      if (!mode) {
+        const policy = config.syncMode;
+        if (policy === "push") mode = "push";
+        else if (policy === "pull") mode = "pull";
       }
       const root = await textus.files.root();
       if (!root) {
@@ -880,7 +926,25 @@ class Controller {
       const report = (fraction, message) => {
         this.broadcast({ progress: { fraction, message } });
       };
-      const result = await synchronize(gh, config, base, root, signal, report, mode);
+      let result = await synchronize(gh, config, base, root, signal, report, mode);
+
+      // A conflict policy other than "ask" settles every conflict the same
+      // way and gives the sync one more pass; "ask" (or an unfinished pass)
+      // leaves the list on the panel for per-file decisions.
+      if (result.conflicts.length && config.conflictPolicy && config.conflictPolicy !== "ask") {
+        const settled = await this.applyConflictPolicy(
+          gh,
+          config,
+          result.conflicts,
+          config.conflictPolicy,
+          root,
+          base,
+          result,
+          signal,
+        );
+        await this.ctx.storage.project.set("base", settled.base);
+        result = await synchronize(gh, config, settled.base, root, signal, report, mode);
+      }
 
       if (result.conflicts.length) {
         this.state.conflicts = result.conflicts;
@@ -898,12 +962,14 @@ class Controller {
         fileShas: result.fileShas || base.fileShas || {},
       });
       this.state.lastSync = new Date().toISOString();
+      const pushed = result.pushed || 0;
+      const pulled = result.pulled || 0;
+      if (pushed) this.state.lastPush = new Date().toISOString();
+      if (pulled) this.state.lastPull = new Date().toISOString();
       this.state.conflicts = null;
       this.state.synced = true;
       this.state.ahead = 0;
       this.state.behind = 0;
-      const pushed = result.pushed || 0;
-      const pulled = result.pulled || 0;
       this.broadcast({
         syncing: false,
         progress: null,
@@ -926,6 +992,45 @@ class Controller {
       this.busy = false;
       this.abort = null;
     }
+  }
+
+  // Settle every conflict by one rule, without syncing: write files and
+  // record the base so the caller's second synchronize pass carries the
+  // outcome. Shapes mirror resolveConflict's per-file choices.
+  async applyConflictPolicy(gh, config, conflicts, choice, root, base, result, signal) {
+    const fileShas = { ...(base.fileShas || {}) };
+    const byRel = result.remote || new Map();
+    const localShas = result.local || new Map();
+    for (const conflict of conflicts) {
+      const rel = conflict.rel;
+      if (choice === "local") {
+        // The local version wins: base it, so the next pass pushes it.
+        if (localShas.has(rel)) fileShas[rel] = localShas.get(rel);
+        else delete fileShas[rel]; // local deletion wins
+      } else if (choice === "remote") {
+        // The remote version wins: overwrite (or remove) the local file.
+        const info = byRel.get(rel);
+        if (info) {
+          await textus.files.write(root + "/" + rel, await gh.getBlob(info.sha, signal));
+          fileShas[rel] = info.sha;
+        } else {
+          await textus.files.trash(root + "/" + rel).catch(() => {});
+          delete fileShas[rel];
+        }
+      } else if (choice === "both") {
+        // Keep both: the remote copy becomes a sibling file, the local wins.
+        const info = byRel.get(rel);
+        if (info && localShas.get(rel) !== info.sha) {
+          const bytes = await gh.getBlob(info.sha, signal);
+          const stem = rel.replace(/\.[^.]+$/, "");
+          const ext = rel.includes(".") ? rel.slice(rel.lastIndexOf(".")) : ".md";
+          await textus.files.write(root + "/" + stem + " (remote)" + ext, bytes);
+        }
+        if (localShas.has(rel)) fileShas[rel] = localShas.get(rel);
+        else delete fileShas[rel];
+      }
+    }
+    return { base: { commitSha: base.commitSha || null, fileShas } };
   }
 
   async autoPull() {
@@ -1019,7 +1124,10 @@ class Pacer {
   saved() {
     this.since = Date.now();
     if (this.timer) clearTimeout(this.timer);
-    this.timer = setTimeout(() => this.fire(), this.settleMs);
+    // The delay is a setting (settleSeconds), re-read on every save burst.
+    const seconds =
+      (this.controller.state.config && this.controller.state.config.settleSeconds) || 5;
+    this.timer = setTimeout(() => this.fire(), seconds * 1000);
   }
 
   async fire() {
@@ -1027,7 +1135,7 @@ class Pacer {
     const config = this.controller.state.config;
     if (!config || !config.autoPush) return;
     if (this.controller.busy) return;
-    await this.controller.runSync("push");
+    await this.controller.runSync("push", { commitMessage: config.commitMessage });
   }
 }
 

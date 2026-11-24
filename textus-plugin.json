@@ -3,8 +3,12 @@
   "name": "%name%",
   "publisher": "luckylew23",
   "version": "0.1.2",
-  "engines": { "textus": ">=1.4.3" },
-  "platforms": ["desktop"],
+  "engines": {
+    "textus": ">=1.4.3"
+  },
+  "platforms": [
+    "desktop"
+  ],
   "main": "host.js",
   "icon": "icon.svg",
   "license": "MIT",
@@ -19,16 +23,34 @@
     "notifications",
     "hidden:.gitignore"
   ],
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "commands": [
-      { "command": "luckylew23.github-sync.open", "title": "%cmd.open%" },
-      { "command": "luckylew23.github-sync.sync", "title": "%cmd.sync%" },
-      { "command": "luckylew23.github-sync.push", "title": "%cmd.push%" },
-      { "command": "luckylew23.github-sync.pull", "title": "%cmd.pull%" }
+      {
+        "command": "luckylew23.github-sync.open",
+        "title": "%cmd.open%"
+      },
+      {
+        "command": "luckylew23.github-sync.sync",
+        "title": "%cmd.sync%"
+      },
+      {
+        "command": "luckylew23.github-sync.push",
+        "title": "%cmd.push%"
+      },
+      {
+        "command": "luckylew23.github-sync.pull",
+        "title": "%cmd.pull%"
+      }
     ],
     "menus": {
-      "app/plugins": [{ "command": "luckylew23.github-sync.open" }]
+      "app/plugins": [
+        {
+          "command": "luckylew23.github-sync.open"
+        }
+      ]
     },
     "sidebarTabs": [
       {
@@ -104,15 +126,38 @@
       "conflict.resolve": "Resolve",
       "settings.autoPush": "Auto-push on save",
       "settings.autoPull": "Auto-pull",
-      "settings.autoPullEvery": "Pull every {0} minutes",
-      "settings.maxSize": "Skip files larger than {0} MB",
+      "settings.autoPullEvery": "Auto-pull interval",
+      "settings.maxSize": "Max file size (MB)",
       "error.auth": "GitHub token is invalid or expired. Reconnect in Settings.",
       "error.repo": "Repository not found or no access.",
       "error.nonFastForward": "Remote has newer changes. Pull first, then push.",
       "error.rateLimit": "GitHub API rate limit reached. Try again later.",
       "error.network": "Network error. Check your connection or proxy.",
       "error.fileTooLarge": "File {0} is too large ({1} MB). Skipped.",
-      "error.unknown": "An unexpected error occurred: {0}"
+      "error.unknown": "An unexpected error occurred: {0}",
+      "commit.placeholder": "Describe your changes… (optional commit message)",
+      "platform.github": "Hosted on GitHub",
+      "action.saveSettings": "Save settings",
+      "sync.lastPush": "Last push:",
+      "sync.lastPull": "Last pull:",
+      "settings.autoPush.hint": "Pushes 5 seconds after a save; bursts of saves fold into one push.",
+      "settings.autoPull.hint": "Fetches and fast-forwards in the background. Skipped while there are local changes to push.",
+      "settings.autoSyncOnOpen": "Sync when the panel opens (click the sidebar icon to sync)",
+      "settings.minutes": "{0} minutes",
+      "settings.syncMode": "Sync direction",
+      "settings.syncmode.both": "Two-way",
+      "settings.syncmode.push": "Push only",
+      "settings.syncmode.pull": "Pull only",
+      "settings.conflictPolicy": "When files conflict",
+      "settings.conflictpolicy.ask": "Ask me for each file",
+      "settings.conflictpolicy.local": "Keep local",
+      "settings.conflictpolicy.remote": "Keep remote",
+      "settings.conflictpolicy.both": "Keep both",
+      "settings.exclude": "Excluded files",
+      "settings.exclude.hint": "One glob per line or comma-separated, same rules as .gitignore. The folder's .gitignore applies as well.",
+      "sync.done": "Done: pushed {0}, pulled {1}",
+      "state.cancelled": "Cancelled",
+      "state.noFolder": "Open a folder to sync it."
     },
     "zh": {
       "name": "GitHub 同步",
@@ -170,15 +215,38 @@
       "conflict.resolve": "解决",
       "settings.autoPush": "保存时自动推送",
       "settings.autoPull": "自动拉取",
-      "settings.autoPullEvery": "每 {0} 分钟拉取一次",
-      "settings.maxSize": "跳过大于 {0} MB 的文件",
+      "settings.autoPullEvery": "自动拉取间隔",
+      "settings.maxSize": "单文件大小上限（MB）",
       "error.auth": "GitHub 令牌无效或已过期。请在设置中重新连接。",
       "error.repo": "仓库不存在或无权限。",
       "error.nonFastForward": "远端有新的更改。请先拉取再推送。",
       "error.rateLimit": "GitHub API 速率限制已达到。请稍后重试。",
       "error.network": "网络错误。请检查连接或代理。",
       "error.fileTooLarge": "文件 {0} 太大（{1} MB），已跳过。",
-      "error.unknown": "发生意外错误：{0}"
+      "error.unknown": "发生意外错误：{0}",
+      "commit.placeholder": "描述你的改动…（可选的提交信息）",
+      "platform.github": "托管在 GitHub",
+      "action.saveSettings": "保存设置",
+      "sync.lastPush": "上次推送:",
+      "sync.lastPull": "上次拉取:",
+      "settings.autoPush.hint": "保存后 5 秒推送，连续保存会合并为一次。",
+      "settings.autoPull.hint": "后台拉取并快进合并。本地有未推送修改时跳过。",
+      "settings.autoSyncOnOpen": "打开面板时同步（点击侧边栏图标即触发同步）",
+      "settings.minutes": "{0} 分钟",
+      "settings.syncMode": "同步方向",
+      "settings.syncmode.both": "双向同步",
+      "settings.syncmode.push": "仅推送",
+      "settings.syncmode.pull": "仅拉取",
+      "settings.conflictPolicy": "文件冲突时",
+      "settings.conflictpolicy.ask": "逐个文件询问",
+      "settings.conflictpolicy.local": "保留本地",
+      "settings.conflictpolicy.remote": "保留远端",
+      "settings.conflictpolicy.both": "两份都保留",
+      "settings.exclude": "排除文件",
+      "settings.exclude.hint": "每行一个或逗号分隔，规则同 .gitignore。文件夹里的 .gitignore 同样生效。",
+      "sync.done": "完成：推送 {0}，拉取 {1}",
+      "state.cancelled": "已取消",
+      "state.noFolder": "先打开一个文件夹再同步。"
     }
   }
 }

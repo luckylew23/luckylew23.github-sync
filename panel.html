@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<link rel="stylesheet" href="panel.css">
+<link rel="stylesheet" href="textus-resource:panel.css">
 </head>
 <body>
   <!-- The panel is one screen per phase: setup (token → repo → branch),
@@ -46,32 +46,49 @@
       <header>
         <h1 id="repo-name"></h1>
         <p class="hint" id="last-sync"></p>
+        <p class="hint" id="bound"></p>
       </header>
 
       <p id="message" hidden></p>
       <div id="progress" class="progress" hidden><div id="progress-bar"></div></div>
       <p class="error" id="main-error" hidden></p>
 
+      <input id="commit-message" type="text" spellcheck="false">
+      <div class="actions">
+        <button id="push"></button>
+        <button id="pull"></button>
+        <button id="sync" class="primary"></button>
+      </div>
+
       <div id="conflicts" hidden>
         <h2 id="conflicts-title"></h2>
         <ul id="conflict-list"></ul>
       </div>
 
-      <div class="actions">
-        <button id="sync" class="primary"></button>
-        <button id="push"></button>
-        <button id="pull"></button>
-      </div>
-
       <details id="settings">
         <summary id="settings-title"></summary>
         <label class="check"><input type="checkbox" id="auto-push"> <span id="auto-push-label"></span></label>
+        <p class="hint" id="auto-push-hint"></p>
         <label class="check"><input type="checkbox" id="auto-pull"> <span id="auto-pull-label"></span></label>
+        <p class="hint" id="auto-pull-hint"></p>
+        <label class="check"><input type="checkbox" id="auto-sync-on-open"> <span id="auto-sync-on-open-label"></span></label>
+        <label for="pull-minutes" id="pull-minutes-label"></label>
+        <select id="pull-minutes"></select>
+        <label for="sync-mode" id="sync-mode-label"></label>
+        <select id="sync-mode"></select>
+        <label for="conflict-policy" id="conflict-policy-label"></label>
+        <select id="conflict-policy"></select>
+        <label for="exclude" id="exclude-label"></label>
+        <textarea id="exclude" rows="3" spellcheck="false"></textarea>
+        <p class="hint" id="exclude-hint"></p>
+        <label for="max-size" id="max-size-label"></label>
+        <input id="max-size" type="number" min="1" step="1">
+        <button id="save-settings" class="primary"></button>
         <button id="disconnect" class="quiet"></button>
       </details>
     </section>
 
   </main>
-  <script src="panel.js"></script>
+  <script src="textus-resource:panel.js"></script>
 </body>
 </html>
