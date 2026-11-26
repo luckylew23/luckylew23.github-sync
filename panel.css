@@ -1,197 +1,207 @@
-/* GitHub Sync panel. Every colour, radius and font comes from Textus's
-   theme variables; nothing is hardcoded. */
-
-:root {
-  --gap: 12px;
-}
-
+/* On top of Textus's plugin-ui base: only the theme variables plugins get,
+   and no colour, radius or font size written by hand. */
 body {
-  font: inherit;
-  color: var(--text-primary, inherit);
-  background: transparent;
-  margin: 0;
-  padding: var(--gap);
+  padding: var(--space-4) var(--space-4) var(--space-6);
+  font-size: var(--text-body);
+  color: var(--ui-text);
+  overflow-x: hidden;
 }
 
-main {
-  display: flex;
-  flex-direction: column;
-  gap: var(--gap);
-}
-
-h1 {
-  font-size: 1.1em;
-  margin: 0;
+body * {
+  min-width: 0;
 }
 
 h2 {
-  font-size: 1em;
-  margin: 0 0 var(--gap);
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-body);
+  font-weight: 600;
+}
+
+h3 {
+  margin: var(--space-4) 0 var(--space-2);
+  font-size: var(--text-footnote);
+  font-weight: 600;
+  color: var(--ui-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+p {
+  margin: 0 0 var(--space-2);
+  overflow-wrap: anywhere;
 }
 
 label {
   display: block;
-  margin-bottom: 4px;
+  margin: var(--space-3) 0 var(--space-1);
+  font-size: var(--text-footnote);
+  color: var(--ui-muted);
+}
+
+.hint {
+  font-size: var(--text-footnote);
+  color: var(--ui-muted);
+}
+
+.error {
+  color: var(--ui-danger);
+  font-size: var(--text-footnote);
+  overflow-wrap: anywhere;
 }
 
 input[type="text"],
 input[type="password"],
 input[type="number"],
-textarea,
 select,
-input:not([type]) {
+textarea {
   width: 100%;
   box-sizing: border-box;
-  padding: 6px 8px;
-  border: 1px solid var(--border, currentColor);
-  border-radius: var(--radius, 6px);
-  background: var(--bg-input, transparent);
-  color: inherit;
+  height: var(--control-height);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--shape-m);
+  background: var(--ui-subtle);
+  color: var(--ui-text);
+  font: inherit;
+}
+
+textarea {
+  height: auto;
+  padding: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-footnote);
+  line-height: 1.5;
+  resize: vertical;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 2px solid var(--ui-border);
+  outline-offset: 1px;
 }
 
 button {
-  padding: 6px 14px;
-  border: 1px solid var(--border, currentColor);
-  border-radius: var(--radius, 6px);
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
+  height: var(--control-height);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--shape-m);
+  background: var(--ui-subtle);
+  color: var(--ui-text);
+  font: inherit;
+  cursor: default;
 }
 
-button.primary {
-  background: var(--accent, var(--text-primary, currentColor));
-  color: var(--bg-primary, #fff);
-  border-color: transparent;
-}
-
-button.quiet {
-  border-color: transparent;
-  opacity: 0.75;
+button:hover:not(:disabled) {
+  background: var(--ui-border);
 }
 
 button:disabled {
   opacity: 0.5;
-  cursor: default;
 }
 
-.step {
-  margin-top: var(--gap);
+button.primary {
+  background: var(--ui-text);
+  color: var(--ui-subtle);
+  border-color: transparent;
+}
+
+.row {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+  margin: var(--space-2) 0;
 }
 
-.hint {
-  opacity: 0.7;
-  margin: 0;
-  font-size: 0.9em;
+.row > input {
+  flex: 1 1 8em;
 }
 
-.error {
-  color: var(--danger, #c0392b);
-  margin: 0;
-  font-size: 0.9em;
-}
-
-.pick-list {
-  max-height: 180px;
-  overflow: auto;
-  border: 1px solid var(--border, currentColor);
-  border-radius: var(--radius, 6px);
-}
-
-.pick-list button {
-  display: block;
-  width: 100%;
-  text-align: left;
-  border: none;
-  border-radius: 0;
-}
-
-.choices {
+.check {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 var(--space-1);
+  color: var(--ui-text);
+  font-size: var(--text-body);
 }
 
-.progress {
-  height: 6px;
-  border-radius: 3px;
-  background: var(--bg-input, rgba(127, 127, 127, 0.2));
+.check input {
+  width: auto;
+  height: auto;
+  margin: 0;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+header h2 {
+  margin-bottom: 0;
+  flex: 1 1 auto;
+}
+
+header .hint {
+  flex: 0 0 auto;
+}
+
+#progress {
+  margin: var(--space-2) 0;
+}
+
+#progress .bar {
+  height: 4px;
+  margin-top: var(--space-1);
+  border-radius: var(--shape-m);
+  background: var(--ui-border);
   overflow: hidden;
 }
 
-.progress > div {
+#progress-bar {
+  width: 0;
   height: 100%;
-  background: var(--accent, currentColor);
-  transition: width 0.2s;
+  background: var(--ui-text);
+  transition: width 120ms linear;
 }
 
 #conflict-list {
   list-style: none;
   margin: 0;
   padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
 }
 
-.conflict {
-  border: 1px solid var(--border, currentColor);
-  border-radius: var(--radius, 6px);
-  padding: 8px;
+#conflict-list li {
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--ui-border);
 }
 
-.conflict .file {
-  font-weight: 600;
-  margin-bottom: 6px;
-  word-break: break-all;
+#conflict-list code {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: var(--text-footnote);
+  overflow-wrap: anywhere;
 }
 
-.conflict .resolve {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
+#skipped {
+  white-space: pre-wrap;
+  margin-top: var(--space-2);
 }
 
-.conflict .resolve button {
-  font-size: 0.85em;
-  padding: 3px 8px;
+details {
+  margin-top: var(--space-4);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--ui-border);
 }
 
-.actions {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
+summary {
+  font-size: var(--text-footnote);
+  color: var(--ui-muted);
+  cursor: default;
 }
 
-#settings summary {
-  cursor: pointer;
-  opacity: 0.8;
-}
-
-.check {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-top: 8px;
-}
-
-#settings label:not(.check),
-#settings input,
-#settings select,
-#settings textarea {
-  margin-top: 8px;
-}
-
-#settings .hint {
-  margin-top: 2px;
-}
-
-#save-settings {
-  margin-top: var(--gap);
-}
-
-#disconnect {
-  margin-top: 8px;
+details .row {
+  margin-top: var(--space-3);
 }

@@ -1,94 +1,149 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<link rel="stylesheet" href="textus-resource:panel.css">
-</head>
-<body>
-  <!-- The panel is one screen per phase: setup (token → repo → branch),
-       first-choice (both sides have content), and the main sync view.
-       Textus applies its theme variables to the page, so every colour,
-       radius and font comes from them. -->
-  <main id="app">
-
-    <section id="setup" hidden>
-      <h1 id="setup-title"></h1>
-
-      <div class="step" id="step-token">
-        <label for="token" id="token-label"></label>
-        <input id="token" type="password" autocomplete="off" spellcheck="false">
-        <p class="hint" id="token-hint"></p>
-        <button id="connect" class="primary"></button>
-        <p class="error" id="token-error" hidden></p>
+  <head>
+    <meta charset="utf-8" />
+    <title>GitHub Sync</title>
+    <link rel="stylesheet" href="textus-resource:panel.css" />
+    <script src="textus-resource:panel.js" defer></script>
+  </head>
+  <body>
+    <section id="setup">
+      <h2 data-i18n="setup.title"></h2>
+      <div id="token-step">
+        <label for="token" data-i18n="setup.token"></label>
+        <input id="token" type="password" autocomplete="off" data-i18n-placeholder="setup.token.placeholder" />
+        <p class="hint" data-i18n="setup.token.hint"></p>
+        <button id="connect" class="primary" data-i18n="setup.connect"></button>
       </div>
 
-      <div class="step" id="step-repo" hidden>
-        <label for="repo-input" id="repo-label"></label>
-        <input id="repo-input" spellcheck="false">
-        <div id="repo-list" class="pick-list" hidden></div>
-        <label for="branch-input" id="branch-label"></label>
-        <input id="branch-input" spellcheck="false">
-        <button id="finish" class="primary"></button>
-        <p class="error" id="repo-error" hidden></p>
+      <div id="repo-step" hidden>
+        <p id="who" class="hint"></p>
+        <label for="repos" data-i18n="setup.repo"></label>
+        <select id="repos"></select>
+        <div class="row">
+          <input id="owner" data-i18n-placeholder="setup.owner.placeholder" />
+          <input id="repo" data-i18n-placeholder="setup.repo.placeholder" />
+        </div>
+        <label for="branch" data-i18n="setup.branch"></label>
+        <input id="branch" value="main" />
+
+        <div class="row">
+          <button id="finish" class="primary" data-i18n="setup.finish"></button>
+          <button id="create-toggle" data-i18n="setup.createRepo"></button>
+        </div>
+
+        <div id="create-box" hidden>
+          <input id="new-repo" data-i18n-placeholder="setup.repo.placeholder" />
+          <label class="check">
+            <input id="new-private" type="checkbox" checked />
+            <span data-i18n="setup.repo.private"></span>
+          </label>
+          <button id="create" class="primary" data-i18n="setup.create"></button>
+        </div>
       </div>
+
+      <p id="setup-error" class="error"></p>
     </section>
 
     <section id="first" hidden>
-      <h1 id="first-title"></h1>
-      <div class="choices">
-        <button id="first-push" class="primary"></button>
-        <button id="first-pull"></button>
-        <button id="first-cancel" class="quiet"></button>
+      <h2 data-i18n="first.title"></h2>
+      <p id="first-body"></p>
+      <p class="hint" data-i18n="first.hint"></p>
+      <div class="row">
+        <button id="first-push" data-i18n="first.push"></button>
+        <button id="first-pull" data-i18n="first.pull"></button>
       </div>
     </section>
 
     <section id="main" hidden>
       <header>
-        <h1 id="repo-name"></h1>
-        <p class="hint" id="last-sync"></p>
-        <p class="hint" id="bound"></p>
+        <h2 id="repo-name"></h2>
+        <span id="quota" class="hint"></span>
       </header>
+      <p id="last-sync" class="hint"></p>
+      <p id="message"></p>
+      <div id="progress" hidden>
+        <span id="progress-label"></span>
+        <div class="bar"><div id="progress-bar"></div></div>
+      </div>
+      <p id="main-error" class="error" hidden></p>
 
-      <p id="message" hidden></p>
-      <div id="progress" class="progress" hidden><div id="progress-bar"></div></div>
-      <p class="error" id="main-error" hidden></p>
-
-      <input id="commit-message" type="text" spellcheck="false">
-      <div class="actions">
-        <button id="push"></button>
-        <button id="pull"></button>
-        <button id="sync" class="primary"></button>
+      <div class="row">
+        <input id="commit-message" data-i18n-placeholder="settings.commit.placeholder" />
+        <button id="sync" class="primary" data-i18n="action.sync"></button>
+        <button id="push" data-i18n="action.push"></button>
+        <button id="pull" data-i18n="action.pull"></button>
       </div>
 
       <div id="conflicts" hidden>
-        <h2 id="conflicts-title"></h2>
+        <h3 data-i18n="conflict.title"></h3>
+        <p class="hint" data-i18n="conflict.hint"></p>
         <ul id="conflict-list"></ul>
       </div>
 
       <details id="settings">
-        <summary id="settings-title"></summary>
-        <label class="check"><input type="checkbox" id="auto-push"> <span id="auto-push-label"></span></label>
-        <p class="hint" id="auto-push-hint"></p>
-        <label class="check"><input type="checkbox" id="auto-pull"> <span id="auto-pull-label"></span></label>
-        <p class="hint" id="auto-pull-hint"></p>
-        <label class="check"><input type="checkbox" id="auto-sync-on-open"> <span id="auto-sync-on-open-label"></span></label>
-        <label for="pull-minutes" id="pull-minutes-label"></label>
-        <select id="pull-minutes"></select>
-        <label for="sync-mode" id="sync-mode-label"></label>
-        <select id="sync-mode"></select>
-        <label for="conflict-policy" id="conflict-policy-label"></label>
-        <select id="conflict-policy"></select>
-        <label for="exclude" id="exclude-label"></label>
-        <textarea id="exclude" rows="3" spellcheck="false"></textarea>
-        <p class="hint" id="exclude-hint"></p>
-        <label for="max-size" id="max-size-label"></label>
-        <input id="max-size" type="number" min="1" step="1">
-        <button id="save-settings" class="primary"></button>
-        <button id="disconnect" class="quiet"></button>
+        <summary data-i18n="action.settings"></summary>
+
+        <label class="check">
+          <input id="auto-push" type="checkbox" />
+          <span data-i18n="settings.autoPush"></span>
+        </label>
+        <p class="hint" data-i18n="settings.autoPush.hint"></p>
+
+        <label class="check">
+          <input id="auto-pull" type="checkbox" />
+          <span data-i18n="settings.autoPull"></span>
+        </label>
+        <p class="hint" data-i18n="settings.autoPull.hint"></p>
+
+        <label for="pull-minutes" data-i18n="settings.minutes"></label>
+        <input id="pull-minutes" type="number" min="1" max="1440" value="5" />
+
+        <label for="settle-seconds" data-i18n="settings.settle"></label>
+        <p class="hint" data-i18n="settings.settle.hint"></p>
+        <input id="settle-seconds" type="number" min="1" max="120" value="5" />
+
+        <label class="check">
+          <input id="sync-on-open" type="checkbox" />
+          <span data-i18n="settings.syncOnOpen"></span>
+        </label>
+
+        <label for="mode" data-i18n="settings.mode"></label>
+        <select id="mode">
+          <option value="merge" data-i18n="settings.mode.merge"></option>
+          <option value="push" data-i18n="settings.mode.push"></option>
+          <option value="pull" data-i18n="settings.mode.pull"></option>
+        </select>
+
+        <label for="on-remote-delete" data-i18n="settings.onRemoteDelete"></label>
+        <select id="on-remote-delete">
+          <option value="restore" data-i18n="settings.onRemoteDelete.restore"></option>
+          <option value="delete" data-i18n="settings.onRemoteDelete.delete"></option>
+        </select>
+
+        <label for="conflict-policy" data-i18n="settings.conflictPolicy"></label>
+        <select id="conflict-policy">
+          <option value="ask" data-i18n="settings.conflictpolicy.ask"></option>
+          <option value="local" data-i18n="settings.conflictpolicy.local"></option>
+          <option value="remote" data-i18n="settings.conflictpolicy.remote"></option>
+          <option value="both" data-i18n="settings.conflictpolicy.both"></option>
+        </select>
+
+        <label for="max-size" data-i18n="settings.maxSize"></label>
+        <p class="hint" data-i18n="settings.maxSize.hint"></p>
+        <input id="max-size" type="number" min="1" max="32" step="1" value="20" />
+
+        <label for="rules" data-i18n="settings.rules"></label>
+        <p class="hint" data-i18n="settings.rules.hint"></p>
+        <textarea id="rules" rows="8" spellcheck="false"></textarea>
+
+        <p id="skipped" class="hint" hidden></p>
+
+        <div class="row">
+          <button id="save-settings" class="primary" data-i18n="action.saveSettings"></button>
+          <button id="disconnect" data-i18n="action.disconnect"></button>
+        </div>
       </details>
     </section>
-
-  </main>
-  <script src="textus-resource:panel.js"></script>
-</body>
+  </body>
 </html>

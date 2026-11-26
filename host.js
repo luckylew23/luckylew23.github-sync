@@ -1,1150 +1,1051 @@
-/// <reference path="textus.d.ts" />
-
-// GitHub Sync: two-way sync between the open folder and a GitHub repository.
+// GitHub Sync — keeps a Textus folder as a plain git repository on GitHub.
 //
-// The plugin cannot run a real git (Textus plugins are sandboxed in a
-// webview; textus.git has no push/pull/fetch). It uses GitHub's Git
-// Database REST API instead, which lets one sync become one atomic commit:
+// Design notes (why the sync looks like this):
 //
-//   push  GET tree  -> POST blobs (N) -> POST tree (1) -> POST commit (1) -> PATCH ref (1)
-//   pull  GET tree  -> GET blobs  (M) -> write/trash locally
-//
-// To know what changed without downloading anything, the plugin computes
-// each file's GitHub blob SHA locally (sha1("blob " + len + "\0" + content))
-// and compares it against the remote tree and against the SHA it recorded
-// after the last sync (a three-way diff). A file where local and remote
-// both moved away from that base is a conflict, resolved per file.
+// - One sync is one commit: blobs, then a tree, then a commit, then the ref
+//   moves. A sync that dies half way leaves the branch exactly as it was, so
+//   the repository can never hold half of a change.
+// - The plugin remembers, per path, the blob hash both sides agreed on
+//   ("base"). Every decision compares three states - local, remote, base.
+//   Without base "deleted here" and "added there" look identical, and
+//   guessing which one it is is how sync plugins lose files.
+// - Deleting is the one irreversible act, so it never happens on its own: a
+//   file deleted on GitHub is put back here unless this folder's own
+//   deletion is what removed it. The cloud-sync plugin learned that the hard
+//   way; this plugin keeps the rule.
+// - The remote side is an ordinary git repository - real paths, no encrypted
+//   chunks, no lock or manifest files. Any git client can read it, and a
+//   sync costs a handful of requests instead of three per file, which keeps
+//   it inside GitHub's 5000 requests an hour.
+// - Nothing is filtered by file type. The settings say what to leave out
+//   (gitignore syntax) and how large a file may be; what is skipped is
+//   reported, not silently dropped.
 
 const PLUGIN_ID = "luckylew23.github-sync";
 const VIEW_ID = PLUGIN_ID + ".tab";
+const STATUS_ID = PLUGIN_ID + ".status";
 const API = "https://api.github.com";
-
-// Scheduling: wait this long after a save before pushing, and this long
-// between auto-pulls (minutes). The debounce folds a burst of saves into
-// one push; the interval is the steady-state poll.
-const SETTLE_MS = 5000;
-const DEFAULT_PULL_MINUTES = 5;
 const PUSH_RETRIES = 3;
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MiB, overridable in settings
+const MAX_BLOB = 32 * 1024 * 1024;
+const DEFAULT_MAX_FILE = 20 * 1024 * 1024;
 
-// ---------------------------------------------------------------------------
-// Small utilities
-// ---------------------------------------------------------------------------
+// Directories that never sync, whatever the rules say: .git is a repository
+// of its own (writing into it would corrupt it) and .textus holds this
+// plugin's own state.
+const HARD_EXCLUDES = [/(^|\/)\.git\//, /(^|\/)\.textus\//];
+
+const DEFAULT_RULES = [
+  "# One rule a line, gitignore syntax. A trailing / excludes a folder,",
+  "# ! brings a path back, # is a comment. A pattern without / matches at",
+  "# any depth.",
+  ".git/",
+  ".textus/",
+  "node_modules/",
+  "dist/",
+  "build/",
+  "target/",
+  ".DS_Store",
+  "Thumbs.db",
+  "desktop.ini",
+  "*.tmp",
+  "*.swp",
+  "*.part",
+  "# Keep secrets off GitHub - uncomment and adjust:",
+  "# secrets/",
+  "# *.kdbx",
+].join("\n");
+
+const DEFAULTS = {
+  owner: "",
+  repo: "",
+  branch: "main",
+  mode: "merge", // merge | push | pull
+  onRemoteDelete: "restore", // restore | delete
+  conflictPolicy: "ask", // ask | local | remote | both
+  maxFileSize: DEFAULT_MAX_FILE,
+  rules: DEFAULT_RULES,
+  commitMessage: "",
+  autoPush: true,
+  autoPull: true,
+  pullMinutes: 5,
+  settleSeconds: 5,
+  syncOnOpen: false,
+  last: null,
+};
+
+// --- bytes and hashes ----------------------------------------------------
 
 function bytesToBase64(bytes) {
   let binary = "";
   const chunk = 0x8000;
   for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode.apply(
-      null,
-      bytes.subarray(i, Math.min(i + chunk, bytes.length)),
-    );
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
   }
   return btoa(binary);
 }
 
-function base64ToBytes(b64) {
-  const binary = atob(b64);
+function base64ToBytes(text) {
+  const binary = atob(String(text || "").replace(/\s+/g, ""));
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 }
 
-const textEncoder = new TextEncoder();
-
-// A GitHub blob's SHA-1, computed locally: sha1("blob " + length + "\0" + content).
-// This is what lets us diff without downloading the remote files.
+// Git names a file by the SHA-1 of "blob <length>\0<content>", so a local
+// hash can be compared with a tree entry without fetching the file. This is
+// what makes "did it change?" free.
 async function blobSha(bytes) {
-  const header = textEncoder.encode("blob " + bytes.length + "\0");
-  const whole = new Uint8Array(header.length + bytes.length);
-  whole.set(header, 0);
-  whole.set(bytes, header.length);
-  const digest = await crypto.subtle.digest("SHA-1", whole);
-  const view = new Uint8Array(digest);
+  const header = new TextEncoder().encode("blob " + bytes.length + "\u0000");
+  const all = new Uint8Array(header.length + bytes.length);
+  all.set(header, 0);
+  all.set(bytes, header.length);
+  const digest = await crypto.subtle.digest("SHA-1", all);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// --- exclusion rules -----------------------------------------------------
+//
+// The gitignore subset people already know, so a copied .gitignore behaves
+// the way it does in git.
+
+function globToRegexSource(glob) {
   let out = "";
-  for (let i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, "0");
+  for (let i = 0; i < glob.length; ) {
+    const piece = glob.slice(i).match(/^(\*\*\/|\*\*|\*|\?|\[[^\]]*\]|\\.)/u);
+    if (!piece) {
+      out += glob[i].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      i += 1;
+      continue;
+    }
+    const token = piece[1];
+    i += token.length;
+    if (token === "**/") out += "(?:[^/]+/)*";
+    else if (token === "**") out += ".*";
+    else if (token === "*") out += "[^/]*";
+    else if (token === "?") out += "[^/]";
+    else if (token.startsWith("\\")) out += token[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    else {
+      const body = token.slice(1, -1);
+      // [!abc] means "none of these" in a gitignore.
+      out += body.startsWith("!") ? "[^" + body.slice(1) + "]" : "[" + body + "]";
+    }
+  }
   return out;
 }
 
-function relPath(path) {
-  return path.replace(/^\/+/, "");
-}
-
-// ---------------------------------------------------------------------------
-// .gitignore matching (a small, conservative subset)
-// ---------------------------------------------------------------------------
-
-function parseGitignore(text) {
-  const patterns = [];
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
+function parseRules(text) {
+  const rules = [];
+  for (const raw of String(text || "").split(/\r?\n/)) {
+    let line = raw.trim();
     if (!line || line.startsWith("#")) continue;
-    patterns.push(line);
-  }
-  return patterns;
-}
-
-// Whether `path` (relative, forward slashes) matches a .gitignore pattern.
-// Negations ("!") are treated as "include after all", the common case.
-function isIgnored(path, patterns) {
-  let ignored = false;
-  for (const pattern of patterns) {
-    const negated = pattern.startsWith("!");
-    const p = (negated ? pattern.slice(1) : pattern).replace(/\/+$/, "");
-    if (!p) continue;
-    if (matchPattern(p, path)) ignored = !negated;
-  }
-  return ignored;
-}
-
-function matchPattern(pattern, path) {
-  // A pattern without a slash matches a file or folder by name anywhere.
-  if (!pattern.includes("/")) {
-    for (const part of path.split("/")) {
-      if (globMatch(pattern, part)) return true;
+    let negate = false;
+    if (line.startsWith("!")) {
+      negate = true;
+      line = line.slice(1).trim();
     }
-    return false;
+    let dirOnly = false;
+    if (line.endsWith("/")) {
+      dirOnly = true;
+      line = line.slice(0, -1);
+    }
+    // A leading slash means "this path from the folder's top", as in git;
+    // without it the name matches at any depth.
+    const anchored = line.startsWith("/") || line.includes("/");
+    line = line.replace(/^\.\//, "").replace(/^\/+/, "");
+    if (!line) continue;
+    const body = globToRegexSource(line);
+    let regex;
+    try {
+      regex = anchored ? new RegExp("^" + body + "$", "u") : new RegExp("(^|/)" + body + "$", "u");
+    } catch {
+      continue; // an unusable rule must not break the whole sync
+    }
+    rules.push({ negate, dirOnly, regex });
   }
-  // A pattern with a slash is matched against the whole path.
-  const anchored = pattern.startsWith("/");
-  const p = anchored ? pattern.slice(1) : pattern;
-  return globMatch(p, path) || path.startsWith(p + "/");
+  return rules;
 }
 
-function globMatch(glob, str) {
-  const regex = new RegExp(
-    "^" +
-      glob
-        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-        .replace(/\*\*/g, "\u0000")
-        .replace(/\*/g, "[^/]*")
-        .replace(/\?/g, "[^/]")
-        .replace(/\u0000/g, ".*") +
-      "$",
-  );
-  return regex.test(str);
+function hardExcluded(rel) {
+  return HARD_EXCLUDES.some((regex) => regex.test(rel));
 }
 
-// ---------------------------------------------------------------------------
-// GitHub REST API
-// ---------------------------------------------------------------------------
+// A rule that matched a folder excludes everything under it, as in git:
+// "build/" has to exclude build/app.js without naming it.
+function isExcluded(rel, isDir, rules) {
+  const parts = rel.split("/");
+  const parents = parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join("/"));
+  let excluded = false;
+  for (const rule of rules) {
+    const hit = (!rule.dirOnly || isDir) && rule.regex.test(rel) ? true : parents.some((parent) => rule.regex.test(parent));
+    if (hit) excluded = !rule.negate;
+  }
+  return excluded;
+}
+
+// --- GitHub --------------------------------------------------------------
+//
+// Only the Git Database endpoints, plus two account calls to pick a
+// repository: the file endpoints cost one request per file, and a first sync
+// of a few hundred files would use up the hour's budget.
 
 class ApiError extends Error {
-  constructor(status, message, kind) {
+  constructor(status, kind, message) {
     super(message);
     this.status = status;
     this.kind = kind;
   }
 }
 
+function apiKind(status, body) {
+  const message = String((body && body.message) || "");
+  if (status === 401) return "auth";
+  if (status === 403 && /rate limit/i.test(message)) return "rateLimit";
+  if (status === 403 || status === 404) return message.includes("not found") ? "notFound" : "auth";
+  if (status === 409) return "conflict";
+  if (status === 422) return "nonFastForward";
+  if (status >= 500) return "server";
+  return "error";
+}
+
+function parseJson(text) {
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch {
+    return null;
+  }
+}
+
 class GitHub {
-  constructor(token, owner, repo) {
+  constructor(token, config) {
     this.token = token;
-    this.owner = owner;
-    this.repo = repo;
+    this.config = config;
+    this.quota = null;
   }
 
-  async request(method, path, body, signal) {
-    const res = await textus.net.fetch(API + path, {
+  get repoPath() {
+    return "/repos/" + encodeURIComponent(this.config.owner) + "/" + encodeURIComponent(this.config.repo);
+  }
+
+  headers(extra) {
+    return {
+      Authorization: "Bearer " + this.token,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      ...extra,
+    };
+  }
+
+  note(response) {
+    // GitHub reports the hour's budget on every answer; showing it saves
+    // the user from wondering why a sync suddenly says "rate limit".
+    const left = response.headers.get("x-ratelimit-remaining");
+    const reset = response.headers.get("x-ratelimit-reset");
+    if (left !== null) this.quota = { left: Number(left), reset: reset === null ? null : Number(reset) * 1000 };
+  }
+
+  async request(method, path, body, signal, left = 2) {
+    const response = await textus.net.fetch(API + path, {
       method,
-      headers: {
-        Authorization: "token " + this.token,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
+      headers: this.headers(body ? { "Content-Type": "application/json" } : {}),
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
     });
-    const text = await res.text();
-    const json = text ? JSON.parse(text) : {};
-    if (res.status === 401) {
-      throw new ApiError(401, "invalid token", "auth");
+    this.note(response);
+    const text = await response.text();
+    if (response.ok) return parseJson(text);
+    const data = parseJson(text);
+    const kind = apiKind(response.status, data);
+    const wait = Number(response.headers.get("retry-after"));
+    // A server hiccup or GitHub's secondary limit is worth waiting out once;
+    // a used-up hourly budget is not.
+    if (left > 0 && (kind === "server" || response.status === 429 || (response.status === 403 && wait > 0))) {
+      await new Promise((resolve) => setTimeout(resolve, wait > 0 ? wait * 1000 : 2000));
+      return this.request(method, path, body, signal, left - 1);
     }
-    if (res.status === 403 && /rate limit/i.test(json.message || "")) {
-      throw new ApiError(403, "rate limited", "rateLimit");
-    }
-    if (res.status === 404) {
-      throw new ApiError(404, "not found", "notFound");
-    }
-    if (res.status === 409) {
-      // 409 on GET ref = empty repo; on POST/PATCH = a race to be retried.
-      throw new ApiError(409, json.message || "conflict", "conflict");
-    }
-    if (res.status === 422) {
-      throw new ApiError(422, json.message || "unprocessable", "nonFastForward");
-    }
-    if (res.status >= 400) {
-      throw new ApiError(res.status, json.message || "error", "error");
-    }
-    return json;
+    throw new ApiError(response.status, kind, (data && data.message) || response.status + " " + method + " " + path);
   }
 
-  async whoAmI(signal) {
-    return this.request("GET", "/user", undefined, signal);
+  whoAmI() {
+    return this.request("GET", "/user");
   }
 
-  async listRepos(signal) {
-    return this.request(
-      "GET",
-      "/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member",
-      undefined,
-      signal,
-    );
+  listRepos() {
+    return this.request("GET", "/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member");
   }
 
-  async createRepo(name, isPrivate, signal) {
-    return this.request("POST", "/user/repos", { name, private: isPrivate }, signal);
+  createRepo(name, isPrivate) {
+    return this.request("POST", "/user/repos", { name, private: isPrivate, auto_init: false });
   }
 
-  // The branch's commit SHA and tree SHA, or null when the branch is absent.
   async branchHead(branch, signal) {
-    try {
-      const data = await this.request(
-        "GET",
-        "/repos/" + this.owner + "/" + this.repo + "/branches/" + branch,
-        undefined,
-        signal,
-      );
-      return {
-        commit: data.commit.sha,
-        tree: data.commit.commit.tree.sha,
-      };
-    } catch (e) {
-      if (e.kind === "notFound") return null;
-      throw e;
+    const response = await textus.net.fetch(API + this.repoPath + "/branches/" + encodeURIComponent(branch), {
+      headers: this.headers(),
+      signal,
+    });
+    this.note(response);
+    if (response.status === 404) return null;
+    const text = await response.text();
+    if (!response.ok) {
+      const data = parseJson(text);
+      throw new ApiError(response.status, apiKind(response.status, data), text);
     }
+    const data = parseJson(text);
+    return { commit: data.commit.sha, tree: data.commit.commit.tree.sha };
   }
 
-  // A flat map of path -> { sha, size } for every blob under `tree`.
   async treeBlobs(tree, signal) {
-    const data = await this.request(
-      "GET",
-      "/repos/" + this.owner + "/" + this.repo + "/git/trees/" + tree + "?recursive=1",
-      undefined,
-      signal,
-    );
-    const out = new Map();
-    for (const entry of data.tree || []) {
-      if (entry.type === "blob") out.set(entry.path, { sha: entry.sha, size: entry.size });
+    const data = await this.request("GET", this.repoPath + "/git/trees/" + tree + "?recursive=1", undefined, signal);
+    if (data.truncated) {
+      // GitHub truncates above ~100k entries; syncing half of a folder
+      // silently would be worse than refusing.
+      throw new ApiError(0, "truncated", "tree truncated");
     }
-    return out;
+    const blobs = new Map();
+    for (const entry of data.tree || []) {
+      if (entry.type === "blob") blobs.set(entry.path, { sha: entry.sha, size: entry.size || 0 });
+    }
+    return blobs;
+  }
+
+  async getBlob(sha, signal) {
+    const data = await this.request("GET", this.repoPath + "/git/blobs/" + sha, undefined, signal);
+    return base64ToBytes(data.content);
   }
 
   async createBlob(bytes, signal) {
     const data = await this.request(
       "POST",
-      "/repos/" + this.owner + "/" + this.repo + "/git/blobs",
+      this.repoPath + "/git/blobs",
       { content: bytesToBase64(bytes), encoding: "base64" },
       signal,
     );
     return data.sha;
   }
 
-  async createTree(baseTree, entries, signal) {
-    const data = await this.request(
+  // entries: [{path, sha}] where sha === null deletes the path.
+  async commit(message, entries, head, signal) {
+    const tree = await this.request(
       "POST",
-      "/repos/" + this.owner + "/" + this.repo + "/git/trees",
-      { base_tree: baseTree || undefined, tree: entries },
+      this.repoPath + "/git/trees",
+      {
+        base_tree: head ? head.tree : undefined,
+        tree: entries.map((entry) => ({ path: entry.path, mode: "100644", type: "blob", sha: entry.sha })),
+      },
       signal,
     );
-    return data.sha;
-  }
-
-  async createCommit(message, tree, parents, signal) {
-    const data = await this.request(
+    const commit = await this.request(
       "POST",
-      "/repos/" + this.owner + "/" + this.repo + "/git/commits",
-      { message, tree, parents },
+      this.repoPath + "/git/commits",
+      { message, tree: tree.sha, parents: head ? [head.commit] : [] },
       signal,
     );
-    return data.sha;
-  }
-
-  async updateRef(branch, sha, signal) {
-    return this.request(
-      "PATCH",
-      "/repos/" + this.owner + "/" + this.repo + "/git/refs/heads/" + branch,
-      { sha },
-      signal,
-    );
-  }
-
-  // Write one file through the contents API, which also creates the branch
-  // and the first commit when the repository has none. Each path segment is
-  // encoded: a file name may hold '#', '?' or a space.
-  async putFile(rel, bytes, message, branch, signal) {
-    const path = rel.split("/").map(encodeURIComponent).join("/");
-    return this.request(
-      "PUT",
-      "/repos/" + this.owner + "/" + this.repo + "/contents/" + path,
-      { message, content: bytesToBase64(bytes), branch },
-      signal,
-    );
-  }
-
-  async getBlob(sha, signal) {
-    const data = await this.request(
-      "GET",
-      "/repos/" + this.owner + "/" + this.repo + "/git/blobs/" + sha,
-      undefined,
-      signal,
-    );
-    return base64ToBytes(data.content.replace(/\n/g, ""));
+    const ref = { ref: "refs/heads/" + this.config.branch, sha: commit.sha };
+    if (head) await this.request("PATCH", this.repoPath + "/git/refs/heads/" + encodeURIComponent(this.config.branch), { sha: commit.sha, force: false }, signal);
+    else await this.request("POST", this.repoPath + "/git/refs", ref, signal);
+    return commit.sha;
   }
 }
 
-// ---------------------------------------------------------------------------
-// Local workspace scan
-// ---------------------------------------------------------------------------
+// --- the folder ----------------------------------------------------------
+//
+// The planner needs one thing per path: a hash. Local hashes are cached
+// against size and modification time, so a folder of a few thousand files
+// re-hashes only what changed since the last sync.
 
-// Returns [{ rel, path, size }] for every file to sync: not a dot-folder,
-// not matched by .gitignore or the settings' exclude patterns, and under
-// the size cap. Extra patterns are comma- or newline-separated globs with
-// the same matching rules as .gitignore lines.
-async function scanFiles(root, gitignore, maxSize, signal, extra) {
-  const patterns = [
-    ...(gitignore ? parseGitignore(gitignore) : []),
-    ...parseGitignore((extra || []).join("\n")),
-  ];
-  const out = [];
-  async function walk(dir) {
-    const entries = await textus.files.list(dir);
-    for (const entry of entries) {
-      if (signal && signal.aborted) throw new DOMException("aborted", "AbortError");
+async function scanLocal(root, rules, maxBytes, signal, cache) {
+  const files = new Map();
+  const tooLarge = [];
+  let excluded = 0;
+
+  const walk = async (dir) => {
+    if (signal.aborted) throw new ApiError(0, "cancelled", "aborted");
+    for (const entry of await textus.files.list(dir)) {
+      const rel = entry.rel;
+      if (hardExcluded(rel)) continue;
       if (entry.isDir) {
-        if (entry.name.startsWith(".")) continue; // dot-folders are never synced
-        await walk(entry.path);
-      } else {
-        if (isIgnored(entry.rel, patterns)) continue;
-        if (entry.size > maxSize) continue;
-        out.push({ rel: entry.rel, path: entry.path, size: entry.size });
-      }
-    }
-  }
-  await walk(root);
-  return out;
-}
-
-async function readGitignore(root) {
-  try {
-    return await textus.files.readText(root + "/.gitignore");
-  } catch {
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// The sync engine
-// ---------------------------------------------------------------------------
-
-// A three-way diff over the union of local, remote and base paths. Returns
-// { toPush, toPull, conflicts } where each is a list of { rel }. `local` and
-// `remote` are Maps; `base` is the plain object kept in storage, which is
-// normalized here so one diff serves both.
-function diff(local, remote, base) {
-  const baseMap =
-    base instanceof Map ? base : new Map(Object.entries(base || {}));
-  const toPush = [];
-  const toPull = [];
-  const conflicts = [];
-  const paths = new Set([...local.keys(), ...remote.keys(), ...baseMap.keys()]);
-  for (const rel of paths) {
-    const l = local.get(rel);
-    const rInfo = remote.get(rel);
-    const r = rInfo ? (typeof rInfo === "object" ? rInfo.sha : rInfo) : undefined;
-    const b = baseMap.get(rel);
-    if (l === r) continue; // identical, nothing to do
-    if (l !== undefined && r !== undefined && b !== undefined && l !== b && r !== b) {
-      conflicts.push({ rel }); // both moved away from base
-    } else if (l !== undefined && r === undefined && b !== undefined && l !== b) {
-      conflicts.push({ rel }); // remote deleted, local changed
-    } else if (l === undefined && r !== undefined && b !== undefined && r !== b) {
-      conflicts.push({ rel }); // local deleted, remote changed
-    } else if (l !== undefined && (r === b || b === undefined)) {
-      toPush.push({ rel }); // local new or changed, remote unchanged
-    } else if (r !== undefined && (l === b || b === undefined)) {
-      toPull.push({ rel }); // remote new or changed, local unchanged
-    } else if (l === undefined && r === undefined) {
-      // both deleted; nothing to do
-    } else if (r === undefined) {
-      toPull.push({ rel }); // remote deleted, local unchanged: pull the deletion
-    } else {
-      toPush.push({ rel }); // local deleted, remote unchanged: push the deletion
-    }
-  }
-  return { toPush, toPull, conflicts };
-}
-
-// Pull `toPull` down: existing remote blobs are written, rels the remote no
-// longer has are trashed locally. Writes go through files.write so binaries
-// stay intact.
-async function pullFiles(gh, remote, toPull, root, signal, report) {
-  const done = [];
-  for (let i = 0; i < toPull.length; i++) {
-    const { rel } = toPull[i];
-    report && report((i + 1) / toPull.length, "downloading " + rel);
-    const info = remote.get(rel);
-    if (info) {
-      const bytes = await gh.getBlob(info.sha, signal);
-      await textus.files.write(root + "/" + rel, bytes);
-    } else {
-      // Remote deleted it while we were unchanged; delete here too.
-      await textus.files.trash(root + "/" + rel).catch(() => {});
-    }
-    done.push(rel);
-  }
-  return done;
-}
-
-// The commit message is the user's own line when there is one; otherwise
-// Textus names the sync so the history still says what made the change.
-function commitMessage(config) {
-  const custom = config && config.commitMessage && config.commitMessage.trim();
-  return custom || "Sync from Textus";
-}
-
-async function pushFiles(gh, config, local, remote, toPush, head, root, signal, report) {
-  // A repository with no commits rejects the whole Git Data API with
-  // "Git Repository is empty", so the first file goes through the contents
-  // API: that creates the branch and the initial commit for us. Every
-  // later file travels the normal way, in one commit.
-  let pending = toPush;
-  if (!head) {
-    const first = pending.find((change) => local.get(change.rel) !== undefined);
-    if (!first) return null; // only deletions, and there is nothing to delete
-    report && report(0, "uploading " + first.rel);
-    const bytes = await textus.files.read(root + "/" + first.rel);
-    await gh.putFile(first.rel, bytes, commitMessage(config), config.branch, signal);
-    head = await gh.branchHead(config.branch, signal);
-    if (!head) throw new ApiError(500, "the new branch did not appear", "server");
-    pending = pending.filter((change) => change !== first);
-  }
-  if (!pending.length) return head.commit;
-
-  // Create blobs for changed and added files; deletions are a null sha in
-  // the tree. Every entry is relative to the current remote tree, so the
-  // files we did not touch carry over unchanged.
-  const entries = [];
-  let n = 0;
-  for (const { rel } of pending) {
-    const localSha = local.get(rel);
-    if (localSha === undefined) {
-      // Deleted locally: remove from the remote tree.
-      entries.push({ path: rel, mode: "100644", type: "blob", sha: null });
-    } else {
-      report && report(n++ / pending.length, "uploading " + rel);
-      const bytes = await textus.files.read(root + "/" + rel);
-      const sha = await gh.createBlob(bytes, signal);
-      entries.push({ path: rel, mode: "100644", type: "blob", sha });
-    }
-  }
-  report && report(1, "committing");
-  const tree = await gh.createTree(head.tree, entries, signal);
-  const commit = await gh.createCommit(commitMessage(config), tree, [head.commit], signal);
-  await gh.updateRef(config.branch, commit, signal);
-  return commit;
-}
-
-// One full sync: diff, then pull remote-only changes, then push local-only
-// changes (or just one side, depending on `mode`). Returns the outcome.
-async function synchronize(gh, config, base, root, signal, report, mode) {
-  // 1. Remote state.
-  const head = await gh.branchHead(config.branch, signal);
-  const remote = head ? await gh.treeBlobs(head.tree, signal) : new Map();
-
-  // 2. Local state: scan, then hash every file.
-  const gitignore = await readGitignore(root);
-  const files = await scanFiles(root, gitignore, config.maxFileSize || MAX_FILE_SIZE, signal, config.exclude);
-  const local = new Map();
-  for (const f of files) {
-    if (signal && signal.aborted) throw new DOMException("aborted", "AbortError");
-    const bytes = await textus.files.read(f.path);
-    local.set(f.rel, await blobSha(bytes));
-  }
-
-  // 3. Three-way diff against the recorded base.
-  const baseShas = (base && base.fileShas) || {};
-  const { toPush, toPull, conflicts } = diff(local, remote, baseShas);
-  // A conflict stops the sync before anything moves, but the result keeps
-  // the same shape as a completed one: the panel and the Controller read
-  // pushed, pulled and fileShas without asking which outcome it was.
-  if (conflicts.length) {
-    return { conflicts, head, remote, local, fileShas: baseShas, pushed: 0, pulled: 0 };
-  }
-
-  // 4. Pull the remote-only side (unless we were asked to push only).
-  const pulled = [];
-  if (mode !== "push" && toPull.length) {
-    pulled.push(...(await pullFiles(gh, remote, toPull, root, signal, report)));
-  }
-
-  // 5. Push the local-only side (unless pull-only), retrying on a race.
-  // The retry re-reads the branch head so the next attempt bases its tree
-  // on what is actually there now, not on the stale head from before.
-  let newCommit = head ? head.commit : null;
-  let newTree = head ? head.tree : null;
-  let pushedCount = 0;
-  if (mode !== "pull" && toPush.length) {
-    let current = head;
-    for (let attempt = 0; ; attempt++) {
-      try {
-        newCommit = await pushFiles(
-          gh,
-          config,
-          local,
-          remote,
-          toPush,
-          current,
-          root,
-          signal,
-          report,
-        );
-        pushedCount = newCommit ? toPush.length : 0;
-        break;
-      } catch (e) {
-        // Someone else pushed while we worked; re-read and retry.
-        if (e.kind === "nonFastForward" && attempt < PUSH_RETRIES - 1) {
-          current = (await gh.branchHead(config.branch, signal)) || current;
+        if (isExcluded(rel, true, rules)) {
+          excluded += 1;
           continue;
         }
-        throw e;
+        await walk(entry.path);
+        continue;
       }
+      if (isExcluded(rel, false, rules)) {
+        excluded += 1;
+        continue;
+      }
+      if (entry.size > maxBytes) {
+        tooLarge.push({ rel, size: entry.size });
+        continue;
+      }
+      const known = cache ? cache[rel] : null;
+      const usable = known && entry.modifiedMs !== null && known.size === entry.size && known.at === entry.modifiedMs;
+      if (usable) {
+        files.set(rel, { sha: known.sha, size: entry.size });
+        continue;
+      }
+      const sha = await blobSha(await textus.files.read(entry.path));
+      files.set(rel, { sha, size: entry.size });
+      if (cache && entry.modifiedMs !== null) cache[rel] = { sha, size: entry.size, at: entry.modifiedMs };
     }
-    const again = await gh.branchHead(config.branch, signal);
-    if (again) newTree = again.tree;
-  }
-
-  // 6. Record the new base: every path now agrees on both sides.
-  const fileShas = { ...baseShas };
-  for (const rel of pulled) {
-    const info = remote.get(rel);
-    if (info) fileShas[rel] = info.sha;
-    else delete fileShas[rel]; // pulled a deletion: it no longer exists
-  }
-  for (const { rel } of toPush) {
-    const sha = local.get(rel);
-    if (sha === undefined) delete fileShas[rel];
-    else fileShas[rel] = sha;
-  }
-  return {
-    conflicts: [],
-    head: newCommit ? { commit: newCommit, tree: newTree } : head,
-    remote,
-    local,
-    fileShas,
-    pushed: pushedCount,
-    pulled: pulled.length,
   };
+
+  await walk(root);
+  return { files, tooLarge, excluded };
 }
 
-// ---------------------------------------------------------------------------
-// The controller: state, panel communication, commands, auto-sync
-// ---------------------------------------------------------------------------
+// --- the plan ------------------------------------------------------------
+//
+// A pure function of (local, remote, base): no I/O, no state. Every case in
+// the table in README.md can be read off here and tested without a network.
+// An entry names a local and a remote path separately, because "keep both"
+// downloads to a different name.
 
-class Controller {
+function conflictName(rel, now) {
+  const slash = rel.lastIndexOf("/");
+  const dir = slash < 0 ? "" : rel.slice(0, slash + 1);
+  const name = slash < 0 ? rel : rel.slice(slash + 1);
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  const stamp = new Date(now).toISOString().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "-");
+  return dir + stem + " (conflict " + stamp + ")" + ext;
+}
+
+function plan(input) {
+  const { local, remote, base, first, mode, onRemoteDelete, now } = input;
+  const result = {
+    pulls: [], // {remote, local, sha}
+    pushes: [], // {local, remote} - local === null deletes the remote path
+    localDeletes: [], // {local}
+    conflicts: [], // {path, kind, remoteSha}
+    dropBase: [],
+    unchanged: 0,
+  };
+  const push = (rel) => result.pushes.push({ local: rel, remote: rel });
+  const pull = (rel) => result.pulls.push({ remote: rel, local: rel, sha: remote.get(rel).sha });
+  const conflict = (rel, kind) => result.conflicts.push({ path: rel, kind, remoteSha: remote.has(rel) ? remote.get(rel).sha : null });
+
+  for (const rel of [...new Set([...local.keys(), ...remote.keys(), ...Object.keys(base)])].sort()) {
+    const mine = local.get(rel);
+    const theirs = remote.get(rel);
+    const agreed = base[rel];
+
+    if (first) {
+      // First connection: the mode decides for a path both sides have.
+      if (mine && theirs) {
+        if (mine.sha === theirs.sha) result.unchanged += 1;
+        else if (mode === "push") push(rel);
+        else if (mode === "pull") pull(rel);
+        else conflict(rel, "bothAdded");
+      } else if (mine) {
+        if (mode === "pull") result.localDeletes.push({ local: rel });
+        else push(rel);
+      } else if (mode === "push") {
+        result.pushes.push({ local: null, remote: rel });
+      } else {
+        pull(rel);
+      }
+      continue;
+    }
+
+    if (mine && theirs) {
+      if (mine.sha === theirs.sha) {
+        result.unchanged += 1;
+        continue;
+      }
+      const localChanged = mine.sha !== agreed;
+      const remoteChanged = theirs.sha !== agreed;
+      if (!agreed || (localChanged && remoteChanged)) conflict(rel, agreed ? "bothChanged" : "bothAdded");
+      else if (localChanged) push(rel);
+      else if (remoteChanged) pull(rel);
+      continue;
+    }
+
+    if (mine) {
+      if (!agreed) {
+        push(rel); // never synced; GitHub simply lacks it
+      } else if (mine.sha === agreed) {
+        // Deleted on GitHub, untouched here: put it back, unless the user
+        // asked for the deletion to win.
+        if (onRemoteDelete === "delete") result.localDeletes.push({ local: rel });
+        else push(rel);
+      } else {
+        conflict(rel, "changedHereDeletedThere");
+      }
+      continue;
+    }
+
+    if (theirs) {
+      if (!agreed) {
+        pull(rel); // never synced; missing here
+      } else if (theirs.sha === agreed) {
+        result.pushes.push({ local: null, remote: rel }); // deleted here, untouched there
+      } else {
+        conflict(rel, "deletedHereChangedThere");
+      }
+      continue;
+    }
+
+    result.dropBase.push(rel);
+  }
+
+  return result;
+}
+
+// Settle every conflict without asking, by the policy in the settings.
+// "both" keeps the remote version beside the local one, so neither side
+// loses a byte; when only one side still has the file there is nothing to
+// keep twice, and the surviving side wins.
+function applyPolicy(result, policy) {
+  for (const conflict of result.conflicts) {
+    const rel = conflict.path;
+    if (policy === "local" || conflict.kind === "changedHereDeletedThere") {
+      result.pushes.push({ local: conflict.kind === "deletedHereChangedThere" ? null : rel, remote: rel });
+    } else if (policy === "remote") {
+      if (conflict.kind === "deletedHereChangedThere") result.pulls.push({ remote: rel, local: rel, sha: conflict.remoteSha });
+      else if (conflict.kind === "changedHereDeletedThere") result.localDeletes.push({ local: rel });
+      else result.pulls.push({ remote: rel, local: rel, sha: conflict.remoteSha });
+    } else {
+      const copy = conflictName(rel, Date.now());
+      if (conflict.kind === "deletedHereChangedThere") {
+        // The local file is gone, the remote one changed: keep the remote
+        // copy beside it, then let the deletion reach GitHub.
+        result.pulls.push({ remote: rel, local: copy, sha: conflict.remoteSha });
+        result.pushes.push({ local: null, remote: rel });
+      } else {
+        // Both versions exist: the remote one lands under a new name.
+        result.pulls.push({ remote: rel, local: copy, sha: conflict.remoteSha });
+        result.pushes.push({ local: rel, remote: rel });
+      }
+    }
+    result.dropBase.push(rel);
+  }
+  result.conflicts = [];
+  return result;
+}
+
+// --- the plugin ----------------------------------------------------------
+
+function formatError(error, t) {
+  if (error instanceof ApiError) return t("error." + error.kind);
+  if (/abort/i.test(String(error && error.message))) return t("error.cancelled");
+  return t("error.network");
+}
+
+class GitHubSync {
   constructor(ctx) {
     this.ctx = ctx;
-    this.views = [];
-    this.abort = null;
+    this.t = (key, ...args) => textus.l10n.t(key, ...args);
+    this.webview = null;
     this.busy = false;
+    this.abort = null;
+    this.timer = null;
+    this.settle = null;
+    this.config = { ...DEFAULTS };
+    this.base = { commit: null, files: {} };
+    this.cache = {};
+    this.status = null;
     this.state = {
       configured: false,
       connected: false,
-      syncing: false,
-      synced: false,
+      busy: false,
       error: null,
-      message: "",
-      progress: null,
-      lastSync: null,
+      message: null,
+      last: null,
       ahead: 0,
       behind: 0,
-      conflicts: null,
-      config: null,
+      conflicts: [],
+      tooLarge: [],
+      excluded: 0,
+      progress: null,
       login: null,
+      quota: null,
     };
-    this.pacer = new Pacer(this, SETTLE_MS, DEFAULT_PULL_MINUTES);
   }
 
-  t(key, ...args) {
-    return textus.l10n.t(key, ...args);
-  }
+  // --- lifecycle ---------------------------------------------------------
 
-  async activate() {
+  activate() {
     const ctx = this.ctx;
-    const subs = ctx.subscriptions;
-
-    subs.push(
-      textus.commands.register(PLUGIN_ID + ".open", () => this.open()),
-      textus.commands.register(PLUGIN_ID + ".sync", () => this.runSync()),
-      textus.commands.register(PLUGIN_ID + ".push", () => this.runSync("push")),
-      textus.commands.register(PLUGIN_ID + ".pull", () => this.runSync("pull")),
+    ctx.subscriptions.push(
+      textus.commands.register(PLUGIN_ID + ".open", () => textus.layout.showSidebarTab(VIEW_ID)),
+      textus.commands.register(PLUGIN_ID + ".sync", () => this.run(DEFAULTS.mode)),
+      textus.commands.register(PLUGIN_ID + ".push", () => this.run("push")),
+      textus.commands.register(PLUGIN_ID + ".pull", () => this.run("pull")),
+      textus.views.registerWebview(VIEW_ID, { resolve: (webview) => this.resolve(webview) }),
+      textus.files.onDidSave(() => this.saved()),
+      textus.files.onDidChangeRoot(() => this.refresh()),
     );
-
-    subs.push(
-      textus.views.registerWebview(VIEW_ID, {
-        resolve: (webview) => this.resolve(webview),
-      }),
-    );
-
-    this.statusHandle = textus.ui.statusItem(PLUGIN_ID + ".status", {
-      text: this.t("status.tooltip"),
+    this.status = textus.ui.statusItem(STATUS_ID, {
+      text: this.t("status.text"),
       tooltip: this.t("status.tooltip"),
       command: PLUGIN_ID + ".open",
     });
-
-    // Auto-push: every save arms a debounce; a quiet spell triggers a push.
-    subs.push(textus.files.onDidSave(() => this.pacer.saved()));
-
-    // A different folder means a different repository; reload everything.
-    subs.push(textus.files.onDidChangeRoot(() => this.refresh()));
-
-    // Steady-state auto-pull.
-    this.restartPullTimer();
-
-    await this.refresh();
+    this.restore().then(() => {
+      this.restartTimer();
+      this.refresh();
+    });
   }
 
-  // The interval is a setting; saving a new value restarts the timer.
-  restartPullTimer() {
-    if (this.pullTimer) clearInterval(this.pullTimer);
-    const minutes = (this.state.config && this.state.config.autoPullMinutes) || DEFAULT_PULL_MINUTES;
-    this.pullTimer = setInterval(() => this.autoPull(), minutes * 60000);
+  async restore() {
+    const saved = await this.ctx.storage.project.get("config");
+    if (saved) this.config = { ...DEFAULTS, ...saved };
+    const base = await this.ctx.storage.project.get("base");
+    if (base) this.base = { commit: base.commit || null, files: base.files || {} };
+    const cache = await this.ctx.storage.project.get("cache");
+    if (cache) this.cache = cache;
+    this.state.configured = Boolean(this.config.owner && this.config.repo);
+    this.state.last = this.config.last || null;
   }
 
-  async refresh() {
-    const root = await textus.files.root();
-    if (!root) {
-      this.state.configured = false;
-      this.state.message = this.t("state.noFolder");
-      this.broadcast();
-      return;
-    }
-    const config = await this.ctx.storage.project.get("config");
-    this.state.config = config || null;
-    this.state.configured = Boolean(config && config.owner && config.repo);
-    this.state.connected = Boolean(await this.ctx.secrets.get("pat"));
-    if (this.state.configured) {
-      await this.countChanges();
-    }
-    this.broadcast();
-    this.showStatus();
+  async persist() {
+    await this.ctx.storage.project.set("config", { ...this.config, last: this.state.last });
   }
 
-  async countChanges() {
-    try {
-      const config = this.state.config;
-      const gh = await this.github();
-      const root = await textus.files.root();
-      if (!root || !gh) return;
-      const head = await gh.branchHead(config.branch);
-      const remote = head ? await gh.treeBlobs(head.tree) : new Map();
-      const gitignore = await readGitignore(root);
-      const files = await scanFiles(root, gitignore, config.maxFileSize || MAX_FILE_SIZE, null, config.exclude);
-      const local = new Map();
-      for (const f of files) {
-        const bytes = await textus.files.read(f.path);
-        local.set(f.rel, await blobSha(bytes));
-      }
-      const base = (await this.ctx.storage.project.get("base")) || { fileShas: {} };
-      const { toPush, toPull, conflicts } = diff(local, remote, base.fileShas || {});
-      this.state.ahead = toPush.length;
-      this.state.behind = toPull.length;
-      this.state.conflicts = conflicts.length ? conflicts : null;
-    } catch (e) {
-      // Status-only; a failed head count must not raise an error dialog.
-    }
-  }
-
-  async github() {
-    const token = await this.ctx.secrets.get("pat");
-    const config = this.state.config;
-    if (!token || !config) return null;
-    return new GitHub(token, config.owner, config.repo);
-  }
-
-  async resolve(webview) {
-    this.views.push(webview);
-    const html = await this.ctx.plugin.readText("panel.html");
-    webview.html = html;
-    webview.onDidReceiveMessage((msg) => this.receive(msg));
+  resolve(webview) {
+    this.webview = webview;
+    this.ctx.plugin.readText("panel.html").then((html) => {
+      webview.html = html;
+    });
+    webview.onDidReceiveMessage((message) => this.receive(message));
     webview.onDidDispose(() => {
-      const i = this.views.indexOf(webview);
-      if (i >= 0) this.views.splice(i, 1);
+      if (this.webview === webview) this.webview = null;
     });
     this.broadcast();
-    // Opening the panel is the "click the icon to sync" gesture: refresh
-    // the ahead/behind counts, and run a full sync when the setting asks.
-    if (this.state.configured) {
-      if (this.state.config.autoSyncOnOpen && !this.busy) {
-        await this.runSync();
-      } else {
-        await this.countChanges();
-      }
-    }
+    if (this.state.configured && this.config.syncOnOpen) this.run(this.config.mode);
   }
 
-  open() {
-    return textus.layout.openView(VIEW_ID, { title: this.t("panel.title") });
+  post(message) {
+    if (this.webview) this.webview.postMessage(message);
   }
 
-  broadcast(patch) {
-    if (patch) Object.assign(this.state, patch);
-    const msg = { type: "state", state: this.state };
-    for (const view of this.views) view.postMessage(msg);
+  broadcast() {
+    this.post({
+      type: "state",
+      state: {
+        ...this.state,
+        config: this.config,
+        base: { files: Object.keys(this.base.files).length, commit: this.base.commit },
+      },
+    });
     this.showStatus();
   }
 
   showStatus() {
-    if (!this.statusHandle) return;
-    let text = "GitHub";
-    if (this.state.syncing) text = this.t("state.syncing");
-    else if (this.state.conflicts) text = this.t("state.conflict");
-    else if (this.state.error) text = this.t("state.error");
-    else if (this.state.connected) text = this.t("state.connected");
-    else text = this.t("state.disconnected");
-    this.statusHandle.update({ text, tooltip: this.t("status.tooltip") });
+    if (!this.status) return;
+    if (this.state.busy) this.status.text = this.t("status.syncing");
+    else if (this.state.error) this.status.text = this.t("status.error");
+    else if (this.state.conflicts.length) this.status.text = this.t("status.conflict", this.state.conflicts.length);
+    else if (this.state.ahead || this.state.behind) this.status.text = this.t("status.pending", this.state.ahead, this.state.behind);
+    else this.status.text = this.t("status.text");
+    this.status.tooltip = this.state.last
+      ? this.t("status.last", new Date(this.state.last.at).toLocaleString())
+      : this.t("status.never");
   }
 
-  async receive(msg) {
-    switch (msg.type) {
+  // --- panel messages ----------------------------------------------------
+
+  async receive(message) {
+    try {
+      await this.handle(message);
+    } catch (error) {
+      this.failed(error);
+    }
+  }
+
+  async handle(message) {
+    switch (message.type) {
       case "ready":
         this.broadcast();
-        break;
+        return;
       case "connect":
-        await this.connect(msg.token);
-        break;
+        await this.connect(String(message.token || "").trim());
+        return;
       case "repos":
-        await this.listRepos();
-        break;
-      case "createRepo":
-        await this.createRepo(msg.name, msg.isPrivate);
-        break;
+        this.post({ type: "repos", repos: await this.listRepos() });
+        return;
+      case "createRepo": {
+        const api = await this.client();
+        const created = await api.createRepo(String(message.name || "").trim(), Boolean(message.private));
+        this.post({ type: "created", fullName: created.full_name });
+        return;
+      }
       case "setup":
-        await this.setup(msg.owner, msg.repo, msg.branch);
-        break;
-      case "sync":
-        await this.runSync(null, msg);
-        break;
-      case "push":
-        await this.runSync("push", msg);
-        break;
-      case "pull":
-        await this.runSync("pull", msg);
-        break;
-      case "resolveConflict":
-        await this.resolveConflict(msg.rel, msg.choice);
-        break;
-      case "firstSync":
-        // The user picked a winner for the first sync of a folder that has
-        // content on both sides; record the losing side as already synced
-        // so the next run only carries the winner's changes.
-        await this.firstSync(msg.choice);
-        break;
-      case "setupCancel":
-        // Back out of a first-choice prompt without syncing either side.
+        this.config.owner = String(message.owner || "").trim();
+        this.config.repo = String(message.repo || "").trim();
+        this.config.branch = String(message.branch || "main").trim() || "main";
+        this.state.configured = true;
+        await this.persist();
         this.broadcast();
-        break;
-      case "disconnect":
-        await this.disconnect();
-        break;
+        await this.firstConnection();
+        return;
+      case "first":
+        await this.run(message.choice === "push" ? "push" : "pull");
+        return;
+      case "sync":
+        await this.run(message.mode || this.config.mode);
+        return;
+      case "resolve": {
+        const conflict = this.findConflict(message.path);
+        if (conflict) await this.resolveConflict(conflict, message.choice);
+        return;
+      }
       case "settings":
-        await this.saveSettings(msg);
-        break;
+        this.config = {
+          ...this.config,
+          autoPush: Boolean(message.autoPush),
+          autoPull: Boolean(message.autoPull),
+          pullMinutes: Math.max(1, Number(message.pullMinutes) || 5),
+          settleSeconds: Math.max(1, Number(message.settleSeconds) || 5),
+          syncOnOpen: Boolean(message.syncOnOpen),
+          mode: ["merge", "push", "pull"].includes(message.mode) ? message.mode : "merge",
+          onRemoteDelete: message.onRemoteDelete === "delete" ? "delete" : "restore",
+          conflictPolicy: ["ask", "local", "remote", "both"].includes(message.conflictPolicy) ? message.conflictPolicy : "ask",
+          maxFileSize: Math.min(MAX_BLOB, Math.round((Number(message.maxFileSizeMb) || 20) * 1024 * 1024)),
+          rules: String(message.rules || ""),
+          commitMessage: String(message.commitMessage || "").trim(),
+        };
+        await this.persist();
+        this.restartTimer();
+        this.broadcast();
+        return;
+      case "disconnect":
+        this.config.owner = "";
+        this.config.repo = "";
+        this.base = { commit: null, files: {} };
+        this.cache = {};
+        this.state.configured = false;
+        this.state.conflicts = [];
+        this.state.ahead = 0;
+        this.state.behind = 0;
+        await this.ctx.storage.project.delete("base");
+        await this.ctx.storage.project.delete("cache");
+        await this.persist();
+        this.broadcast();
+        return;
+      default:
+        return;
     }
+  }
+
+  findConflict(path) {
+    return this.state.conflicts.find((item) => item.path === path) || null;
+  }
+
+  // --- credentials and repository ---------------------------------------
+
+  async client() {
+    const token = await this.ctx.secrets.get("token");
+    if (!token) throw new ApiError(401, "auth", "no token");
+    return new GitHub(token, this.config);
   }
 
   async connect(token) {
-    try {
-      this.broadcast({ syncing: true, error: null });
-      const gh = new GitHub(token, "", "");
-      const user = await gh.whoAmI();
-      await this.ctx.secrets.set("pat", token);
-      this.state.connected = true;
-      this.state.login = user.login;
-      this.state.syncing = false;
-      this.broadcast();
-      await this.listRepos();
-    } catch (e) {
-      this.broadcast({ syncing: false, error: this.t("setup.error.token") });
-    }
+    if (!token) throw new ApiError(401, "auth", "no token");
+    await this.ctx.secrets.set("token", token);
+    const api = await this.client();
+    const user = await api.whoAmI();
+    this.state.connected = true;
+    this.state.login = user.login;
+    this.post({ type: "repos", repos: await this.listRepos() });
+    if (this.state.configured) await this.firstConnection();
+    else this.broadcast();
   }
 
   async listRepos() {
-    const token = await this.ctx.secrets.get("pat");
-    if (!token) return;
-    try {
-      const gh = new GitHub(token, "", "");
-      const repos = await gh.listRepos();
-      for (const view of this.views) {
-        view.postMessage({ type: "repos", repos });
-      }
-    } catch (e) {
-      this.broadcast({ error: this.t("setup.error.network") });
-    }
+    const api = await this.client();
+    const repos = await api.listRepos();
+    return (repos || []).map((repo) => ({ fullName: repo.full_name, private: repo.private }));
   }
 
-  async createRepo(name, isPrivate) {
-    const token = await this.ctx.secrets.get("pat");
-    if (!token) return;
-    try {
-      const gh = new GitHub(token, "", "");
-      const repo = await gh.createRepo(name, isPrivate);
-      const login = repo.owner.login;
-      for (const view of this.views) {
-        view.postMessage({ type: "repoCreated", fullName: login + "/" + repo.name });
-      }
-      await this.listRepos();
-    } catch (e) {
-      this.broadcast({ error: this.t("setup.error.repo") });
-    }
-  }
-
-  async setup(owner, repo, branch) {
-    const config = {
-      owner,
-      repo,
-      branch: branch || "main",
-      autoPush: true,
-      autoPull: true,
-      autoPullMinutes: DEFAULT_PULL_MINUTES,
-      autoSyncOnOpen: false,
-      settleSeconds: 5,
-      syncMode: "both",
-      conflictPolicy: "ask",
-      maxFileSize: MAX_FILE_SIZE,
-      exclude: [],
-    };
-    await this.ctx.storage.project.set("config", config);
-    this.state.config = config;
-    this.state.configured = true;
-    this.broadcast();
-
-    // First sync: if both sides hold content, ask which one wins.
+  async firstConnection() {
+    const api = await this.client();
+    const head = await api.branchHead(this.config.branch);
+    const remote = head ? await api.treeBlobs(head.tree) : new Map();
     const root = await textus.files.root();
-    const gh = new GitHub(await this.ctx.secrets.get("pat"), owner, repo);
-    const head = await gh.branchHead(config.branch).catch(() => null);
-    const remote = head ? await gh.treeBlobs(head.tree).catch(() => new Map()) : new Map();
-    const gitignore = await readGitignore(root);
-    const files = await scanFiles(root, gitignore, config.maxFileSize, null, config.exclude);
-    const hasLocal = files.length > 0;
-    const hasRemote = remote.size > 0;
-
-    if (hasLocal && hasRemote) {
-      for (const view of this.views) {
-        view.postMessage({ type: "firstChoice" });
-      }
+    const { files } = await scanLocal(root, parseRules(this.config.rules), this.config.maxFileSize, new AbortController().signal, null);
+    const shared = [...files.keys()].filter((rel) => remote.has(rel));
+    const differs = shared.filter((rel) => remote.get(rel).sha !== files.get(rel).sha);
+    if (Object.keys(this.base.files).length === 0 && (differs.length > 0 || (shared.length > 0 && files.size !== remote.size))) {
+      // Both sides hold files the plugin has never reconciled: asking costs
+      // one question, guessing wrongly costs the user's work.
+      this.post({ type: "firstChoice", local: files.size, remote: remote.size, shared: shared.length, differs: differs.length });
       return;
     }
-    await this.runSync();
+    await this.run(this.config.mode);
   }
 
-  async saveSettings(msg) {
-    const config = { ...(this.state.config || {}), ...msg };
-    await this.ctx.storage.project.set("config", config);
-    this.state.config = config;
-    this.broadcast();
-    this.restartPullTimer();
-    await this.countChanges();
-  }
+  // --- the sync ----------------------------------------------------------
 
-  // First sync where both sides hold content: the user's choice decides
-  // which side wins as a whole. The winner's files are recorded as the new
-  // base first, so the following sync only moves the loser's changes.
-  async firstSync(choice) {
-    try {
-      const config = this.state.config;
-      const root = await textus.files.root();
-      const gh = await this.github();
-      if (!config || !root || !gh) return;
-      const head = await gh.branchHead(config.branch);
-      const remote = head ? await gh.treeBlobs(head.tree) : new Map();
-      const gitignore = await readGitignore(root);
-      const files = await scanFiles(root, gitignore, config.maxFileSize, null, config.exclude);
-      const local = new Map();
-      for (const f of files) {
-        local.set(f.rel, await blobSha(await textus.files.read(f.path)));
-      }
-      const fileShas = {};
-      if (choice === "push") {
-        // Remote loses: treat the remote state as the base, then push ours
-        // over it (remote-only files are deleted by the push).
-        for (const [rel, info] of remote) fileShas[rel] = info.sha;
-      } else {
-        // Local loses: pull the remote over ours, keeping remote-only files
-        // and deleting local-only ones.
-        for (const [rel, sha] of local) fileShas[rel] = sha;
-        await this.runSync("pull");
-        await this.ctx.storage.project.set("base", {
-          commitSha: head ? head.commit : null,
-          fileShas: Object.fromEntries(remote),
-        });
-        this.broadcast();
-        return;
-      }
-      await this.ctx.storage.project.set("base", { commitSha: head ? head.commit : null, fileShas });
-      await this.runSync("push");
-    } catch (e) {
-      this.broadcast({ error: this.errorText(e) });
-    }
-  }
-
-  async runSync(mode, extra) {
+  async run(mode) {
     if (this.busy) return;
+    if (!this.state.configured) {
+      this.state.error = this.t("error.notConfigured");
+      this.broadcast();
+      return;
+    }
     this.busy = true;
     this.abort = new AbortController();
-    const signal = this.abort.signal;
-    this.broadcast({ syncing: true, error: null, progress: { fraction: 0, message: "" } });
+    this.state = { ...this.state, busy: true, error: null, message: null, progress: null };
+    this.broadcast();
     try {
-      const config = this.state.config;
-      if (!config) {
-        this.broadcast({ syncing: false, error: this.t("state.disconnected") });
-        return;
-      }
-      // The commit line from the panel rides on the sync message; the
-      // settings' own line still wins until the next sync overrides it.
-      if (extra && typeof extra.commitMessage === "string") {
-        config.commitMessage = extra.commitMessage;
-      }
-      // The panel's direction policy decides when no side was named: "both"
-      // is the plain two-way sync, the others pin it to one direction.
-      if (!mode) {
-        const policy = config.syncMode;
-        if (policy === "push") mode = "push";
-        else if (policy === "pull") mode = "pull";
-      }
-      const root = await textus.files.root();
-      if (!root) {
-        this.broadcast({ syncing: false, error: this.t("state.noFolder") });
-        return;
-      }
-      const gh = await this.github();
-      if (!gh) {
-        this.broadcast({ syncing: false, error: this.t("error.auth") });
-        return;
-      }
-      const base = (await this.ctx.storage.project.get("base")) || { fileShas: {} };
-      const report = (fraction, message) => {
-        this.broadcast({ progress: { fraction, message } });
-      };
-      let result = await synchronize(gh, config, base, root, signal, report, mode);
-
-      // A conflict policy other than "ask" settles every conflict the same
-      // way and gives the sync one more pass; "ask" (or an unfinished pass)
-      // leaves the list on the panel for per-file decisions.
-      if (result.conflicts.length && config.conflictPolicy && config.conflictPolicy !== "ask") {
-        const settled = await this.applyConflictPolicy(
-          gh,
-          config,
-          result.conflicts,
-          config.conflictPolicy,
-          root,
-          base,
-          result,
-          signal,
-        );
-        await this.ctx.storage.project.set("base", settled.base);
-        result = await synchronize(gh, config, settled.base, root, signal, report, mode);
-      }
-
-      if (result.conflicts.length) {
-        this.state.conflicts = result.conflicts;
-        this.state.synced = false;
-        this.broadcast({
-          syncing: false,
-          conflicts: result.conflicts,
-          message: this.t("sync.conflicts", result.conflicts.length),
-        });
-        return;
-      }
-
-      await this.ctx.storage.project.set("base", {
-        commitSha: result.head ? result.head.commit : null,
-        fileShas: result.fileShas || base.fileShas || {},
-      });
-      this.state.lastSync = new Date().toISOString();
-      const pushed = result.pushed || 0;
-      const pulled = result.pulled || 0;
-      if (pushed) this.state.lastPush = new Date().toISOString();
-      if (pulled) this.state.lastPull = new Date().toISOString();
-      this.state.conflicts = null;
-      this.state.synced = true;
-      this.state.ahead = 0;
-      this.state.behind = 0;
-      this.broadcast({
-        syncing: false,
-        progress: null,
-        message: this.t("state.synced"),
-      });
-      if (pushed || pulled) {
-        textus.ui.notice(
-          this.t("sync.done", pushed, pulled),
-          { tone: "info" },
-        );
-      }
-      await this.countChanges();
-    } catch (e) {
-      if (e.name === "AbortError") {
-        this.broadcast({ syncing: false, progress: null, message: this.t("state.cancelled") });
-      } else {
-        this.broadcast({ syncing: false, progress: null, error: this.errorText(e) });
-      }
+      await this.sync(mode || this.config.mode);
+    } catch (error) {
+      this.failed(error);
     } finally {
       this.busy = false;
       this.abort = null;
+      this.state.busy = false;
+      this.state.progress = null;
+      this.broadcast();
+      await this.ctx.storage.project.set("cache", this.cache);
     }
   }
 
-  // Settle every conflict by one rule, without syncing: write files and
-  // record the base so the caller's second synchronize pass carries the
-  // outcome. Shapes mirror resolveConflict's per-file choices.
-  async applyConflictPolicy(gh, config, conflicts, choice, root, base, result, signal) {
-    const fileShas = { ...(base.fileShas || {}) };
-    const byRel = result.remote || new Map();
-    const localShas = result.local || new Map();
-    for (const conflict of conflicts) {
-      const rel = conflict.rel;
-      if (choice === "local") {
-        // The local version wins: base it, so the next pass pushes it.
-        if (localShas.has(rel)) fileShas[rel] = localShas.get(rel);
-        else delete fileShas[rel]; // local deletion wins
-      } else if (choice === "remote") {
-        // The remote version wins: overwrite (or remove) the local file.
-        const info = byRel.get(rel);
-        if (info) {
-          await textus.files.write(root + "/" + rel, await gh.getBlob(info.sha, signal));
-          fileShas[rel] = info.sha;
-        } else {
-          await textus.files.trash(root + "/" + rel).catch(() => {});
-          delete fileShas[rel];
-        }
-      } else if (choice === "both") {
-        // Keep both: the remote copy becomes a sibling file, the local wins.
-        const info = byRel.get(rel);
-        if (info && localShas.get(rel) !== info.sha) {
-          const bytes = await gh.getBlob(info.sha, signal);
-          const stem = rel.replace(/\.[^.]+$/, "");
-          const ext = rel.includes(".") ? rel.slice(rel.lastIndexOf(".")) : ".md";
-          await textus.files.write(root + "/" + stem + " (remote)" + ext, bytes);
-        }
-        if (localShas.has(rel)) fileShas[rel] = localShas.get(rel);
-        else delete fileShas[rel];
+  progress(stage, done, total) {
+    this.state.progress = { stage, done, total };
+    this.post({ type: "progress", progress: this.state.progress });
+  }
+
+  async sync(mode) {
+    const signal = this.abort.signal;
+    const api = await this.client();
+    const root = await textus.files.root();
+    if (!root) throw new ApiError(0, "noFolder", "no folder");
+    const rules = parseRules(this.config.rules);
+
+    this.progress("read", 0, 1);
+    const head = await api.branchHead(this.config.branch, signal);
+    const remote = head ? await api.treeBlobs(head.tree, signal) : new Map();
+
+    // A rule that leaves a path out on this side has to leave it out on the
+    // other side too, or one side would delete what the other keeps.
+    const remoteTooLarge = [];
+    for (const [rel, entry] of [...remote]) {
+      if (hardExcluded(rel) || isExcluded(rel, false, rules)) {
+        remote.delete(rel);
+        continue;
+      }
+      if (entry.size > this.config.maxFileSize) {
+        remoteTooLarge.push({ rel, size: entry.size });
+        remote.delete(rel);
       }
     }
-    return { base: { commitSha: base.commitSha || null, fileShas } };
+
+    const { files: local, tooLarge, excluded } = await scanLocal(root, rules, this.config.maxFileSize, signal, this.cache);
+
+    let result = plan({
+      local,
+      remote,
+      base: this.base.files,
+      first: this.base.commit === null,
+      mode,
+      onRemoteDelete: this.config.onRemoteDelete,
+      now: Date.now(),
+    });
+    if (result.conflicts.length && this.config.conflictPolicy !== "ask") {
+      result = applyPolicy(result, this.config.conflictPolicy);
+    }
+
+    const { pulled, pushed } = await this.apply(api, root, local, result, signal);
+
+    this.state.tooLarge = [...tooLarge, ...remoteTooLarge].sort((a, b) => b.size - a.size).slice(0, 50);
+    this.state.excluded = excluded;
+    this.state.conflicts = result.conflicts.map((conflict) => ({ path: conflict.path, kind: conflict.kind }));
+    this.state.last = {
+      at: Date.now(),
+      pulled,
+      pushed,
+      conflicts: this.state.conflicts.length,
+      skipped: this.state.tooLarge.length,
+    };
+    this.state.message = this.state.conflicts.length
+      ? this.t("sync.conflicts", this.state.conflicts.length)
+      : this.t("sync.done", pushed, pulled, this.state.tooLarge.length);
+    await this.persist();
+    await this.recount();
   }
 
-  async autoPull() {
-    if (this.busy) return;
-    const config = this.state.config;
-    if (!config || !config.autoPull) return;
-    const root = await textus.files.root();
-    if (!root) return;
-    // Only pull when there is nothing local to push, so a pull never races
-    // an unsaved edit; the debounced push handles the other direction.
-    await this.countChanges();
-    if (this.state.ahead > 0 || this.state.conflicts) return;
-    await this.runSync("pull");
+  // Downloads first: a pull can replace a file the push would otherwise
+  // upload, and deletions go before commits so one commit carries them all.
+  async apply(api, root, local, result, signal) {
+    const next = {};
+    const touched = new Set();
+    for (const pull of result.pulls) touched.add(pull.local).add(pull.remote);
+    for (const push of result.pushes) if (push.local) touched.add(push.local);
+    for (const deletion of result.localDeletes) touched.add(deletion.local);
+    for (const drop of result.dropBase) touched.add(drop);
+    for (const [rel, sha] of Object.entries(this.base.files)) if (!touched.has(rel)) next[rel] = sha;
+
+    let pulled = 0;
+    for (const pull of result.pulls) {
+      this.progress("download", pulled, result.pulls.length);
+      const bytes = await api.getBlob(pull.sha, signal);
+      await textus.files.write(root + "/" + pull.local, bytes);
+      next[pull.local] = pull.sha;
+      pulled += 1;
+    }
+
+    for (const deletion of result.localDeletes) {
+      await textus.files.trash(root + "/" + deletion.local).catch(() => {});
+      delete next[deletion.local];
+    }
+
+    if (result.pushes.length === 0) {
+      this.base = { commit: this.base.commit, files: next };
+      await this.ctx.storage.project.set("base", this.base);
+      return { pulled, pushed: 0 };
+    }
+
+    const entries = [];
+    const shas = new Map();
+    for (const push of result.pushes) {
+      this.progress("upload", entries.length, result.pushes.length);
+      if (push.local === null) {
+        entries.push({ path: push.remote, sha: null });
+        continue;
+      }
+      const bytes = await textus.files.read(root + "/" + push.local);
+      const sha = await api.createBlob(bytes, signal);
+      entries.push({ path: push.remote, sha });
+      shas.set(push.remote, sha);
+    }
+
+    const message = this.config.commitMessage || this.t("commit.default", shas.size);
+    let head = await api.branchHead(this.config.branch, signal);
+    let commit = null;
+    for (let attempt = 0; commit === null; attempt++) {
+      try {
+        commit = await api.commit(message, entries, head, signal);
+      } catch (error) {
+        // Someone else pushed meanwhile: rebuild on the new tip, and give up
+        // loudly rather than force a ref over their commit.
+        if (error instanceof ApiError && error.kind === "nonFastForward" && attempt < PUSH_RETRIES - 1) {
+          head = await api.branchHead(this.config.branch, signal);
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    for (const [path, sha] of shas) next[path] = sha;
+    for (const entry of entries) if (entry.sha === null) delete next[entry.path];
+
+    this.base = { commit, files: next };
+    await this.ctx.storage.project.set("base", this.base);
+    return { pulled, pushed: shas.size };
   }
 
-  async resolveConflict(rel, choice) {
-    const root = await textus.files.root();
-    const gh = await this.github();
-    const base = (await this.ctx.storage.project.get("base")) || { fileShas: {} };
-    if (choice === "local") {
-      // Keep the local file; next push uploads it over the remote version.
-      await this.ctx.storage.project.set("base", {
-        ...base,
-        fileShas: { ...base.fileShas, [rel]: await blobSha(await textus.files.read(root + "/" + rel)) },
+  // A cheap "how far apart are we" for the status line: hashes only, no file
+  // bodies, and never a write.
+  async recount() {
+    if (this.busy || !this.state.configured) return;
+    try {
+      const api = await this.client();
+      const head = await api.branchHead(this.config.branch);
+      const remote = head ? await api.treeBlobs(head.tree) : new Map();
+      const root = await textus.files.root();
+      if (!root) return;
+      const { files: local } = await scanLocal(root, parseRules(this.config.rules), this.config.maxFileSize, new AbortController().signal, this.cache);
+      const result = plan({
+        local,
+        remote,
+        base: this.base.files,
+        first: this.base.commit === null,
+        mode: "merge",
+        onRemoteDelete: this.config.onRemoteDelete,
+        now: Date.now(),
       });
-      await this.runSync("push");
-    } else if (choice === "remote") {
-      // Keep the remote file; overwrite the local one with it.
-      const head = await gh.branchHead(this.state.config.branch);
-      const remote = await gh.treeBlobs(head.tree);
-      const bytes = await gh.getBlob(remote.get(rel).sha);
-      await textus.files.write(root + "/" + rel, bytes);
-      await this.ctx.storage.project.set("base", {
-        ...base,
-        fileShas: { ...base.fileShas, [rel]: remote.get(rel).sha },
-      });
-      await this.runSync("pull");
-    } else if (choice === "both") {
-      // Keep both: the remote copy becomes a sibling file, the local one wins.
-      const head = await gh.branchHead(this.state.config.branch);
-      const remote = await gh.treeBlobs(head.tree);
-      const bytes = await gh.getBlob(remote.get(rel).sha);
-      const stem = rel.replace(/\.[^.]+$/, "");
-      const ext = rel.includes(".") ? rel.slice(rel.lastIndexOf(".")) : ".md";
-      await textus.files.write(root + "/" + stem + " (remote)" + ext, bytes);
-      await this.ctx.storage.project.set("base", {
-        ...base,
-        fileShas: { ...base.fileShas, [rel]: await blobSha(await textus.files.read(root + "/" + rel)) },
-      });
-      await this.runSync("push");
+      this.state.ahead = result.pushes.length;
+      this.state.behind = result.pulls.length;
+      this.state.quota = api.quota;
+      if (!this.state.conflicts.length) {
+        this.state.conflicts = result.conflicts.map((conflict) => ({ path: conflict.path, kind: conflict.kind }));
+      }
+      this.broadcast();
+    } catch (error) {
+      this.ctx.log.warn("GitHub Sync: status check failed: " + String(error && error.message));
     }
   }
 
-  async disconnect() {
-    await this.ctx.storage.project.delete("config");
-    await this.ctx.storage.project.delete("base");
-    await this.ctx.secrets.delete("pat");
-    this.state = {
-      ...this.state,
-      configured: false,
-      connected: false,
-      config: null,
-      login: null,
-      conflicts: null,
-      ahead: 0,
-      behind: 0,
-    };
+  async refresh() {
+    const root = await textus.files.root();
+    this.state.configured = Boolean(root) && Boolean(this.config.owner && this.config.repo);
+    if (!this.state.configured) {
+      this.broadcast();
+      return;
+    }
+    await this.recount();
+  }
+
+  async resolveConflict(conflict, choice) {
+    const api = await this.client();
+    const root = await textus.files.root();
+    const head = await api.branchHead(this.config.branch);
+    const remote = head ? await api.treeBlobs(head.tree) : new Map();
+    const entry = remote.get(conflict.path);
+    const resolved = { pulls: [], pushes: [], localDeletes: [], dropBase: [conflict.path], conflicts: [], unchanged: 0 };
+    if (choice === "remote") {
+      if (entry) resolved.pulls.push({ remote: conflict.path, local: conflict.path, sha: entry.sha });
+      else resolved.localDeletes.push({ local: conflict.path });
+    } else if (choice === "both" && entry) {
+      resolved.pulls.push({ remote: conflict.path, local: conflictName(conflict.path, Date.now()), sha: entry.sha });
+      resolved.pushes.push({ local: conflict.path, remote: conflict.path });
+    } else if (entry) {
+      resolved.pushes.push({ local: conflict.path, remote: conflict.path });
+    } else {
+      resolved.pushes.push({ local: null, remote: conflict.path });
+    }
+    const { files: local } = await scanLocal(root, parseRules(this.config.rules), this.config.maxFileSize, new AbortController().signal, this.cache);
+    await this.apply(api, root, local, resolved, new AbortController().signal);
+    this.state.conflicts = this.state.conflicts.filter((item) => item.path !== conflict.path);
+    this.broadcast();
+    await this.recount();
+  }
+
+  failed(error) {
+    this.ctx.log.error("GitHub Sync: " + String((error && error.stack) || error));
+    this.state.error = formatError(error, this.t);
+    this.state.message = this.state.error;
+    if (error instanceof ApiError && error.kind === "rateLimit") this.state.quota = { left: 0, reset: null };
     this.broadcast();
   }
 
-  errorText(e) {
-    if (e.kind === "auth") return this.t("error.auth");
-    if (e.kind === "rateLimit") return this.t("error.rateLimit");
-    if (e.kind === "notFound") return this.t("error.repo");
-    if (e.kind === "nonFastForward") return this.t("error.nonFastForward");
-    if (e instanceof ApiError) return this.t("error.unknown", e.message);
-    return this.t("error.network");
-  }
-}
-
-// A small debounce + interval scheduler, modeled on the cloud-sync plugin's
-// Pacer: a save arms a settle timer; a quiet spell fires the push.
-class Pacer {
-  constructor(controller, settleMs, pullMinutes) {
-    this.controller = controller;
-    this.settleMs = settleMs;
-    this.timer = null;
-    this.since = null;
-  }
+  // --- background work ---------------------------------------------------
 
   saved() {
-    this.since = Date.now();
-    if (this.timer) clearTimeout(this.timer);
-    // The delay is a setting (settleSeconds), re-read on every save burst.
-    const seconds =
-      (this.controller.state.config && this.controller.state.config.settleSeconds) || 5;
-    this.timer = setTimeout(() => this.fire(), seconds * 1000);
+    if (!this.config.autoPush || !this.state.configured) return;
+    if (this.settle) clearTimeout(this.settle);
+    this.settle = setTimeout(() => {
+      this.settle = null;
+      this.run("push");
+    }, Math.max(1, this.config.settleSeconds) * 1000);
   }
 
-  async fire() {
+  restartTimer() {
+    if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    const config = this.controller.state.config;
-    if (!config || !config.autoPush) return;
-    if (this.controller.busy) return;
-    await this.controller.runSync("push", { commitMessage: config.commitMessage });
+    if (!this.config.autoPull || !this.state.configured) return;
+    this.timer = setInterval(() => {
+      // A pull while this side has its own changes would either overwrite
+      // them or manufacture conflicts nobody asked for; the merge is the
+      // user's next sync.
+      if (this.state.ahead === 0 && this.state.conflicts.length === 0) this.run("pull");
+    }, Math.max(1, this.config.pullMinutes) * 60 * 1000);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
-exports.activate = function (ctx) {
-  const controller = new Controller(ctx);
-  ctx.subscriptions.push({ dispose: () => controller.pacer.timer && clearTimeout(controller.pacer.timer) });
-  return controller.activate();
+exports.activate = (ctx) => {
+  const plugin = new GitHubSync(ctx);
+  plugin.activate();
+  return plugin;
 };
+
+// Node can load this file, which is how the table in README.md is tested;
+// Textus hands the plugin an `exports` object instead.
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { plan, applyPolicy, parseRules, isExcluded, hardExcluded, conflictName, blobSha };
+}
