@@ -6,7 +6,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { parseRules, isExcluded, hardExcluded, plan, applyPolicy, conflictName, blobSha } = require("../host.js");
+const { parseRules, isExcluded, hardExcluded, plan, applyPolicy, trashPath, blobSha } = require("../host.js");
 
 const rules = (text) => parseRules(text);
 const excluded = (path, text, isDir = false) => isExcluded(path, isDir, rules(text));
@@ -66,12 +66,14 @@ test(".git and .textus are never synced, whatever the rules say", () => {
 const A = "a".repeat(40);
 const B = "b".repeat(40);
 const C = "c".repeat(40);
+// One fixed moment, so a .trash folder name is predictable: 20261126-040506.
+const NOW = Date.UTC(2026, 10, 26, 4, 5, 6);
 
 function entry(sha) {
   return { sha, size: 10 };
 }
 
-function run({ local = {}, remote = {}, base = {}, first = false, mode = "merge", onRemoteDelete = "restore", now = Date.UTC(2026, 10, 26, 4, 5, 6) } = {}) {
+function run({ local = {}, remote = {}, base = {}, first = false, mode = "merge", onRemoteDelete = "restore", now = NOW } = {}) {
   const toMap = (object) => new Map(Object.entries(object).map(([path, sha]) => [path, entry(sha)]));
   return plan({ local: toMap(local), remote: toMap(remote), base, first, mode, onRemoteDelete, now });
 }
@@ -173,30 +175,53 @@ test("policy remote takes GitHub's version", () => {
   assert.equal(result.pulls[0].sha, C);
 });
 
-test("policy both keeps GitHub's version under a new name", () => {
-  const result = applyPolicy(run({ local: { "notes/a.md": B }, remote: { "notes/a.md": C }, base: { "notes/a.md": A } }), "both");
-  assert.equal(result.pulls.length, 1);
-  assert.match(result.pulls[0].local, /^notes\/a \(conflict \d{8}-\d{6}\)\.md$/);
+test("policy both keeps GitHub's version in the .trash folder", () => {
+  const result = applyPolicy(run({ local: { "notes/a.md": B }, remote: { "notes/a.md": C }, base: { "notes/a.md": A } }), "both", NOW);
+  assert.deepEqual(result.pulls, [{ remote: "notes/a.md", local: ".trash/20261126-040506/notes/a.md", sha: C }]);
   assert.deepEqual(result.pushes, [{ local: "notes/a.md", remote: "notes/a.md" }]);
 });
 
 test("policy both with a deletion on one side keeps the survivor only", () => {
-  // Deleted here, changed on GitHub: the GitHub copy comes back under a new
-  // name and the deletion still reaches the branch.
-  const deleted = applyPolicy(run({ remote: { "a.md": B }, base: { "a.md": A } }), "both");
-  assert.match(deleted.pulls[0].local, /^a \(conflict /);
+  // Deleted here, changed on GitHub: the GitHub copy is kept in .trash and
+  // the deletion still reaches the branch.
+  const deleted = applyPolicy(run({ remote: { "a.md": B }, base: { "a.md": A } }), "both", NOW);
+  assert.deepEqual(deleted.pulls.map((pull) => pull.local), [".trash/20261126-040506/a.md"]);
   assert.deepEqual(deleted.pushes, [{ local: null, remote: "a.md" }]);
 
   // Changed here, deleted on GitHub: there is no second copy to keep.
-  const gone = applyPolicy(run({ local: { "a.md": B }, base: { "a.md": A } }), "both");
+  const gone = applyPolicy(run({ local: { "a.md": B }, base: { "a.md": A } }), "both", NOW);
   assert.deepEqual(gone.pushes, [{ local: "a.md", remote: "a.md" }]);
   assert.equal(gone.pulls.length, 0);
 });
 
-test("a conflict name keeps the folder, the extension and a readable time", () => {
-  const name = conflictName("Essays/draft.final.md", Date.UTC(2026, 10, 26, 4, 5, 6));
-  assert.equal(name, "Essays/draft.final (conflict 20261126-040506).md");
-  assert.equal(conflictName("README", Date.UTC(2026, 0, 2, 3, 4, 5)), "README (conflict 20260102-030405)");
+test("a version that loses a conflict goes to the trash, not into the void", () => {
+  const local = applyPolicy(run({ local: { "a.md": B }, remote: { "a.md": C }, base: { "a.md": A } }), "local", NOW);
+  assert.deepEqual(local.trash, [{ path: ".trash/20261126-040506/a.md", sha: C }]);
+
+  const remote = applyPolicy(run({ local: { "a.md": B }, remote: { "a.md": C }, base: { "a.md": A } }), "remote", NOW);
+  assert.deepEqual(remote.trashLocal, [{ from: "a.md", to: ".trash/20261126-040506/a.md" }]);
+  assert.deepEqual(remote.pulls.map((pull) => pull.local), ["a.md"]);
+});
+
+test("a deletion keeps the copy of the side that loses it", () => {
+  // Deleted here, untouched on GitHub: the copy kept is the one GitHub had.
+  const gone = run({ remote: { "a.md": A }, base: { "a.md": A } });
+  assert.deepEqual(gone.pushes, [{ local: null, remote: "a.md" }]);
+  assert.deepEqual(gone.trash, [{ path: ".trash/20261126-040506/a.md", sha: A }]);
+
+  // Deleted on GitHub and the deletion wins: this machine's copy is kept.
+  const deleted = run({ local: { "a.md": A }, base: { "a.md": A }, onRemoteDelete: "delete" });
+  assert.deepEqual(deleted.trashLocal, [{ from: "a.md", to: ".trash/20261126-040506/a.md" }]);
+});
+
+test("a trash path keeps the folder, the extension and a readable time", () => {
+  assert.equal(trashPath("Essays/draft.final.md", NOW), ".trash/20261126-040506/Essays/draft.final.md");
+  assert.equal(trashPath("README", Date.UTC(2026, 0, 2, 3, 4, 5)), ".trash/20260102-030405/README");
+});
+
+test(".trash never syncs back, whatever the rules say", () => {
+  assert.equal(skipped(".trash/20261126-040506/a.md", ""), true);
+  assert.equal(skipped(".trash/20261126-040506/a.md", "!.trash/\n!.trash/**"), true);
 });
 
 // --- hashes -------------------------------------------------------------

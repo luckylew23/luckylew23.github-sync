@@ -21,16 +21,17 @@ To know what changed without downloading anything, the plugin computes each file
 | unchanged | changed | download |
 | unchanged | deleted | **brought back** (or deleted here too, if that is the setting) |
 | changed | deleted | conflict |
-| deleted | unchanged | deleted on GitHub |
+| deleted | unchanged | deleted on GitHub, and this folder's copy goes to `.trash` |
 | deleted | changed | conflict |
 | added | added, same path, different content | conflict (first connection only) |
 
 A few rules are deliberate:
 
 - **Deletions only travel outward from this folder.** The plugin never empties the folder; a file deleted on GitHub comes back, unless the deletion was yours. Mirroring it the other way round is exactly how one sync once wiped a whole workspace.
+- **Nothing disappears on the way.** A version a sync replaces or removes is first copied to `.trash/<time>/<path>`: this folder's `.trash` for the copy it drops here, the repository's `.trash` for the copy it drops there, both in the same commit. `.trash` itself never syncs, so a trash of a trash cannot happen; drag a file out of it to put it back.
 - **A conflict is never guessed.** A file both sides changed waits for you (the panel asks per file); settings can also fix the answer to "keep mine", "take GitHub's" or "keep both".
-- **Keep both** stores GitHub's version as `name (conflict 20261126-040506).ext` in the same commit, so neither side loses a byte.
-- **First connection**: when both the folder and the repository have content, the plugin asks which side wins (or "send only" / "receive only") before anything is overwritten.
+- **Keep both** keeps GitHub's version in this folder's `.trash` and sends mine up, so neither side loses a byte. Whichever side a conflict answer leaves behind ends up in that side's `.trash`; the answer decides who wins, never who survives.
+- **First connection**: when both the folder and the repository have content, the plugin asks which side wins (or "send only" / "receive only") before anything is overwritten; the side that loses keeps its copies in its `.trash`.
 
 ## What is in scope
 
@@ -39,7 +40,7 @@ Nothing is filtered by file type — Markdown, images, PDFs, `.html`, `.json` al
 1. **Rules** in the panel, one per line, written like `.gitignore`: a path, a folder ending in `/`, the wildcards `*`/`?`/`[...]`, a leading `/` to pin a rule to the top of the folder, a leading `!` to put back something an earlier rule excluded. The default rules drop `node_modules/`, the usual build folders and the OS's own files.
 2. **A size limit**, 20 MB by default and adjustable; the plugin's own hard limit is 32 MB a file (the plugin bridge accepts at most a 32 MB response) and GitHub's is 100 MB. Files over the limit stay here, and the panel lists which ones.
 
-`.git` and `.textus` are never synced, whatever the rules say: the first would have the plugin reading its own commits, the second is the plugin's own data.
+`.git`, `.textus` and `.trash` are never synced, whatever the rules say: the first would have the plugin reading its own commits, the second is the plugin's own data, and the third would let a trash's own copies travel back and forth.
 
 ## Setting it up
 

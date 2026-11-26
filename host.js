@@ -30,9 +30,11 @@ const MAX_BLOB = 32 * 1024 * 1024;
 const DEFAULT_MAX_FILE = 20 * 1024 * 1024;
 
 // Directories that never sync, whatever the rules say: .git is a repository
-// of its own (writing into it would corrupt it) and .textus holds this
-// plugin's own state.
-const HARD_EXCLUDES = [/(^|\/)\.git\//, /(^|\/)\.textus\//];
+// of its own (writing into it would corrupt it), .textus holds this plugin's
+// own state, and .trash is where a discarded version is kept (a trash that
+// synced would shuffle its own copies back and forth every time).
+const TRASH_DIR = ".trash/";
+const HARD_EXCLUDES = [/(^|\/)\.git\//, /(^|\/)\.textus\//, /(^|\/)\.trash\//];
 
 const DEFAULT_RULES = [
   "# One rule a line, gitignore syntax. A trailing / excludes a folder,",
@@ -400,18 +402,19 @@ async function scanLocal(root, rules, maxBytes, signal, cache) {
 //
 // A pure function of (local, remote, base): no I/O, no state. Every case in
 // the table in README.md can be read off here and tested without a network.
-// An entry names a local and a remote path separately, because "keep both"
-// downloads to a different name.
+// An entry names a local and a remote path separately, because the copy kept
+// of a discarded version goes to .trash under another name.
 
-function conflictName(rel, now) {
-  const slash = rel.lastIndexOf("/");
-  const dir = slash < 0 ? "" : rel.slice(0, slash + 1);
-  const name = slash < 0 ? rel : rel.slice(slash + 1);
-  const dot = name.lastIndexOf(".");
-  const stem = dot > 0 ? name.slice(0, dot) : name;
-  const ext = dot > 0 ? name.slice(dot) : "";
-  const stamp = new Date(now).toISOString().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "-");
-  return dir + stem + " (conflict " + stamp + ")" + ext;
+// A version that a sync throws away is never lost: it is copied into the
+// folder's own .trash, the way the app and every other editor on this machine
+// does it. One folder per sync, the original path inside it, so putting a file
+// back is a drag from .trash/<when>/ to the top of the folder.
+function trashStamp(now) {
+  return new Date(now).toISOString().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "-");
+}
+
+function trashPath(rel, now) {
+  return TRASH_DIR + trashStamp(now) + "/" + rel;
 }
 
 function plan(input) {
@@ -421,12 +424,21 @@ function plan(input) {
     pushes: [], // {local, remote} - local === null deletes the remote path
     localDeletes: [], // {local}
     conflicts: [], // {path, kind, remoteSha}
+    trash: [], // {path, sha} - the GitHub copy of a version this sync discards
+    trashLocal: [], // {from, to} - the local copy of a version this sync discards
     dropBase: [],
     unchanged: 0,
   };
+  const at = now || Date.now();
   const push = (rel) => result.pushes.push({ local: rel, remote: rel });
   const pull = (rel) => result.pulls.push({ remote: rel, local: rel, sha: remote.get(rel).sha });
   const conflict = (rel, kind) => result.conflicts.push({ path: rel, kind, remoteSha: remote.has(rel) ? remote.get(rel).sha : null });
+  // The GitHub copy of rel goes to the repository's own .trash in the same
+  // commit: the blob is already there, so keeping it costs a tree entry.
+  const keepRemote = (rel) => result.trash.push({ path: trashPath(rel, at), sha: remote.get(rel).sha });
+  // This machine's copy is read and written into .trash before the sync
+  // replaces or removes it.
+  const keepLocal = (rel) => result.trashLocal.push({ from: rel, to: trashPath(rel, at) });
 
   for (const rel of [...new Set([...local.keys(), ...remote.keys(), ...Object.keys(base)])].sort()) {
     const mine = local.get(rel);
@@ -437,13 +449,20 @@ function plan(input) {
       // First connection: the mode decides for a path both sides have.
       if (mine && theirs) {
         if (mine.sha === theirs.sha) result.unchanged += 1;
-        else if (mode === "push") push(rel);
-        else if (mode === "pull") pull(rel);
-        else conflict(rel, "bothAdded");
+        else if (mode === "push") {
+          keepRemote(rel);
+          push(rel);
+        } else if (mode === "pull") {
+          keepLocal(rel);
+          pull(rel);
+        } else conflict(rel, "bothAdded");
       } else if (mine) {
-        if (mode === "pull") result.localDeletes.push({ local: rel });
-        else push(rel);
+        if (mode === "pull") {
+          keepLocal(rel);
+          result.localDeletes.push({ local: rel });
+        } else push(rel);
       } else if (mode === "push") {
+        keepRemote(rel);
         result.pushes.push({ local: null, remote: rel });
       } else {
         pull(rel);
@@ -470,8 +489,10 @@ function plan(input) {
       } else if (mine.sha === agreed) {
         // Deleted on GitHub, untouched here: put it back, unless the user
         // asked for the deletion to win.
-        if (onRemoteDelete === "delete") result.localDeletes.push({ local: rel });
-        else push(rel);
+        if (onRemoteDelete === "delete") {
+          keepLocal(rel);
+          result.localDeletes.push({ local: rel });
+        } else push(rel);
       } else {
         conflict(rel, "changedHereDeletedThere");
       }
@@ -482,7 +503,9 @@ function plan(input) {
       if (!agreed) {
         pull(rel); // never synced; missing here
       } else if (theirs.sha === agreed) {
-        result.pushes.push({ local: null, remote: rel }); // deleted here, untouched there
+        // Deleted here, untouched there: the copy kept is the one GitHub had.
+        keepRemote(rel);
+        result.pushes.push({ local: null, remote: rel });
       } else {
         conflict(rel, "deletedHereChangedThere");
       }
@@ -496,30 +519,39 @@ function plan(input) {
 }
 
 // Settle every conflict without asking, by the policy in the settings.
-// "both" keeps the remote version beside the local one, so neither side
-// loses a byte; when only one side still has the file there is nothing to
+// Whichever version loses is copied to .trash - the GitHub one into the
+// repository's .trash, this machine's into the folder's - so neither side
+// loses a byte. When only one side still has the file there is nothing to
 // keep twice, and the surviving side wins.
-function applyPolicy(result, policy) {
+function applyPolicy(result, policy, now) {
+  const at = now || Date.now();
   for (const conflict of result.conflicts) {
     const rel = conflict.path;
+    const keepRemote = () => {
+      if (conflict.remoteSha) result.trash.push({ path: trashPath(rel, at), sha: conflict.remoteSha });
+    };
     if (policy === "local" || conflict.kind === "changedHereDeletedThere") {
+      keepRemote();
       result.pushes.push({ local: conflict.kind === "deletedHereChangedThere" ? null : rel, remote: rel });
     } else if (policy === "remote") {
-      if (conflict.kind === "deletedHereChangedThere") result.pulls.push({ remote: rel, local: rel, sha: conflict.remoteSha });
-      else if (conflict.kind === "changedHereDeletedThere") result.localDeletes.push({ local: rel });
-      else result.pulls.push({ remote: rel, local: rel, sha: conflict.remoteSha });
-    } else {
-      const copy = conflictName(rel, Date.now());
       if (conflict.kind === "deletedHereChangedThere") {
-        // The local file is gone, the remote one changed: keep the remote
-        // copy beside it, then let the deletion reach GitHub.
-        result.pulls.push({ remote: rel, local: copy, sha: conflict.remoteSha });
-        result.pushes.push({ local: null, remote: rel });
+        // Nothing here to keep: the GitHub version simply comes back.
+        result.pulls.push({ remote: rel, local: rel, sha: conflict.remoteSha });
       } else {
-        // Both versions exist: the remote one lands under a new name.
-        result.pulls.push({ remote: rel, local: copy, sha: conflict.remoteSha });
-        result.pushes.push({ local: rel, remote: rel });
+        result.trashLocal.push({ from: rel, to: trashPath(rel, at) });
+        if (conflict.kind === "changedHereDeletedThere") result.localDeletes.push({ local: rel });
+        else result.pulls.push({ remote: rel, local: rel, sha: conflict.remoteSha });
       }
+    } else if (conflict.remoteSha) {
+      // "both": the GitHub version lands in the folder's .trash and this
+      // machine's version keeps the path. For deletedHereChangedThere the
+      // deletion still reaches GitHub, with the remote copy kept in .trash.
+      result.pulls.push({ remote: rel, local: trashPath(rel, at), sha: conflict.remoteSha });
+      result.pushes.push({ local: conflict.kind === "deletedHereChangedThere" ? null : rel, remote: rel });
+    } else {
+      // GitHub deleted the file and this machine changed it: nothing is left
+      // on the remote side to keep, so the changed file wins and goes back up.
+      result.pushes.push({ local: rel, remote: rel });
     }
     result.dropBase.push(rel);
   }
@@ -869,6 +901,17 @@ class GitHubSync {
     await this.recount();
   }
 
+  // A copy kept in .trash: the folders on the way are made first, because a
+  // version saved for safety must not fail the sync it belongs to.
+  async keepCopy(root, target, bytes) {
+    const path = root + "/" + target;
+    const dir = path.slice(0, path.lastIndexOf("/"));
+    await textus.files.createFolder(dir).catch(() => {});
+    await textus.files.write(path, bytes).catch((error) => {
+      this.ctx.log.warn("GitHub Sync: could not keep a copy in .trash: " + error);
+    });
+  }
+
   // Downloads first: a pull can replace a file the push would otherwise
   // upload, and deletions go before commits so one commit carries them all.
   async apply(api, root, local, result, signal) {
@@ -881,11 +924,24 @@ class GitHubSync {
     for (const [rel, sha] of Object.entries(this.base.files)) if (!touched.has(rel)) next[rel] = sha;
 
     let pulled = 0;
+    // Keep what this sync is about to replace or remove, before it touches
+    // anything: a copy in .trash is a safety net, so a failure there is
+    // logged and does not stop the sync.
+    for (const keep of result.trashLocal) {
+      const bytes = await textus.files.read(root + "/" + keep.from).catch(() => null);
+      if (bytes) await this.keepCopy(root, keep.to, bytes);
+    }
+
     for (const pull of result.pulls) {
       this.progress("download", pulled, result.pulls.length);
       const bytes = await api.getBlob(pull.sha, signal);
-      await textus.files.write(root + "/" + pull.local, bytes);
-      next[pull.local] = pull.sha;
+      if (pull.local.startsWith(TRASH_DIR)) {
+        // A conflict copy lands in .trash, which never syncs: no base entry.
+        await this.keepCopy(root, pull.local, bytes);
+      } else {
+        await textus.files.write(root + "/" + pull.local, bytes);
+        next[pull.local] = pull.sha;
+      }
       pulled += 1;
     }
 
@@ -913,6 +969,11 @@ class GitHubSync {
       entries.push({ path: push.remote, sha });
       shas.set(push.remote, sha);
     }
+
+    // The versions this sync discards on the GitHub side go into the
+    // repository's own .trash in the same commit. Their blobs are already in
+    // the repository, so each costs one tree entry and no upload.
+    for (const keep of result.trash) entries.push({ path: keep.path, sha: keep.sha });
 
     const message = this.config.commitMessage || this.t("commit.default", shas.size);
     let head = await api.branchHead(this.config.branch, signal);
@@ -987,14 +1048,36 @@ class GitHubSync {
     const head = await api.branchHead(this.config.branch);
     const remote = head ? await api.treeBlobs(head.tree) : new Map();
     const entry = remote.get(conflict.path);
-    const resolved = { pulls: [], pushes: [], localDeletes: [], dropBase: [conflict.path], conflicts: [], unchanged: 0 };
+    const at = Date.now();
+    const resolved = {
+      pulls: [],
+      pushes: [],
+      localDeletes: [],
+      conflicts: [],
+      unchanged: 0,
+      trash: [], // {path, sha} - the GitHub copy of the version this drops
+      trashLocal: [], // {from, to} - this machine's copy of it
+      dropBase: [conflict.path],
+    };
+    // Whichever side loses keeps a copy in its own .trash, as in a sync: the
+    // choice decides who wins, never who survives.
     if (choice === "remote") {
-      if (entry) resolved.pulls.push({ remote: conflict.path, local: conflict.path, sha: entry.sha });
-      else resolved.localDeletes.push({ local: conflict.path });
+      if (entry) {
+        resolved.trashLocal.push({ from: conflict.path, to: trashPath(conflict.path, at) });
+        resolved.pulls.push({ remote: conflict.path, local: conflict.path, sha: entry.sha });
+      } else {
+        resolved.localDeletes.push({ local: conflict.path });
+      }
     } else if (choice === "both" && entry) {
-      resolved.pulls.push({ remote: conflict.path, local: conflictName(conflict.path, Date.now()), sha: entry.sha });
-      resolved.pushes.push({ local: conflict.path, remote: conflict.path });
+      // Both stay: the GitHub version lands in the folder's .trash, so a file
+      // this machine no longer has is simply that copy, and the deletion of
+      // the path itself still reaches GitHub.
+      resolved.pulls.push({ remote: conflict.path, local: trashPath(conflict.path, at), sha: entry.sha });
+      const bytes = await textus.files.read(root + "/" + conflict.path).catch(() => null);
+      if (bytes) resolved.pushes.push({ local: conflict.path, remote: conflict.path });
+      else resolved.pushes.push({ local: null, remote: conflict.path });
     } else if (entry) {
+      resolved.trash.push({ path: trashPath(conflict.path, at), sha: entry.sha });
       resolved.pushes.push({ local: conflict.path, remote: conflict.path });
     } else {
       resolved.pushes.push({ local: null, remote: conflict.path });
@@ -1047,5 +1130,5 @@ exports.activate = (ctx) => {
 // Node can load this file, which is how the table in README.md is tested;
 // Textus hands the plugin an `exports` object instead.
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { plan, applyPolicy, parseRules, isExcluded, hardExcluded, conflictName, blobSha };
+  module.exports = { plan, applyPolicy, parseRules, isExcluded, hardExcluded, trashPath, blobSha };
 }
