@@ -1127,8 +1127,16 @@ exports.activate = (ctx) => {
   return plugin;
 };
 
-// Node can load this file, which is how the table in README.md is tested;
-// Textus hands the plugin an `exports` object instead.
+// Node can load this file, which is how the table in README.md is tested.
+// Textus gives the plugin a CommonJS module too, and calls
+// `module.exports.activate`; assigning a fresh object here would leave it
+// with nothing to call, so the extra names go on the object already there.
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { plan, applyPolicy, parseRules, isExcluded, hardExcluded, trashPath, blobSha };
+  module.exports.plan = plan;
+  module.exports.applyPolicy = applyPolicy;
+  module.exports.parseRules = parseRules;
+  module.exports.isExcluded = isExcluded;
+  module.exports.hardExcluded = hardExcluded;
+  module.exports.trashPath = trashPath;
+  module.exports.blobSha = blobSha;
 }

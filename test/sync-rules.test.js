@@ -230,3 +230,14 @@ test("a blob hash is the one git computes", async () => {
   const bytes = new TextEncoder().encode("hello");
   assert.equal(await blobSha(bytes), "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0");
 });
+// --- the entry Textus calls ---------------------------------------------
+
+// Textus loads host.js as a CommonJS module and calls module.exports.activate
+// (src/plugins/host/runtime/host-handlers.js, $activate). Anything here that
+// replaces module.exports or forgets activate leaves the plugin loaded but
+// doing nothing at all - no tab, no command, no message.
+test("the module Textus loads still activates", () => {
+  const host = require("../host.js");
+  assert.equal(typeof host.activate, "function");
+  assert.equal(host.activate.length, 1);
+});

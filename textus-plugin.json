@@ -2,7 +2,7 @@
   "id": "luckylew23.github-sync",
   "name": "%name%",
   "publisher": "luckylew23",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "engines": { "textus": ">=1.4.3" },
   "platforms": ["desktop"],
   "main": "host.js",
