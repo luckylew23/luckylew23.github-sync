@@ -2,20 +2,14 @@
   "id": "luckylew23.github-sync",
   "name": "%name%",
   "publisher": "luckylew23",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "engines": { "textus": ">=1.4.3" },
   "platforms": ["desktop"],
   "main": "host.js",
   "icon": "icon.svg",
   "license": "MIT",
-  "author": {
-    "name": "luckylew23",
-    "url": "https://github.com/luckylew23"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/luckylew23/luckylew23.github-sync.git"
-  },
+  "author": "luckylew23",
+  "repository": "https://github.com/luckylew23/luckylew23.github-sync",
   "description": "%description%",
   "permissions": [
     "files.read",
