@@ -37,17 +37,21 @@ A few rules are deliberate:
 
 Nothing is filtered by file type — Markdown, images, PDFs, `.html`, `.json` all sync. Only two things decide:
 
-1. **Rules** in the panel, one per line, written like `.gitignore`: a path, a folder ending in `/`, the wildcards `*`/`?`/`[...]`, a leading `/` to pin a rule to the top of the folder, a leading `!` to put back something an earlier rule excluded. The default rules drop `node_modules/`, the usual build folders and the OS's own files.
+1. **Rules** in the plugin's settings, one per line, written like `.gitignore`: a path, a folder ending in `/`, the wildcards `*`/`?`/`[...]`, a leading `/` to pin a rule to the top of the folder, a leading `!` to put back something an earlier rule excluded. The default rules drop `node_modules/`, the usual build folders and the OS's own files.
 2. **A size limit**, 20 MB by default and adjustable; the plugin's own hard limit is 32 MB a file (the plugin bridge accepts at most a 32 MB response) and GitHub's is 100 MB. Files over the limit stay here, and the panel lists which ones.
 
 `.git`, `.textus` and `.trash` are never synced, whatever the rules say: the first would have the plugin reading its own commits, the second is the plugin's own data, and the third would let a trash's own copies travel back and forth.
 
 ## Setting it up
 
+Everything is on the plugin's own page in Settings (Settings → Plugins → GitHub
+Sync), so the token, the repository, the rules and the sync strategy are in one
+place, before the first sync and without one.
+
 1. Make a [fine-grained token](https://github.com/settings/tokens?type=beta) with **Contents: read and write** on the repository — or a classic token with `repo`.
-2. Open the panel: the GitHub tab in the sidebar, or "GitHub Sync: Open" in the command palette.
-3. Paste the token → pick or create a repository → pick a branch → start.
-4. If both sides have content, choose which one wins.
+2. Open that page: Settings → Plugins → GitHub Sync, or the GitHub tab in the sidebar and its "Open Settings" button.
+3. Paste the token → pick or create a repository → pick a branch → save.
+4. Back in the sidebar tab ("Open the sync tab"): if both sides have content, choose which one wins.
 
 The token lives in Textus's secret storage, on this computer only, and never reaches the repository; disconnecting can delete it. The repository and the last sync's hashes are remembered in the folder's `.textus/plugins/luckylew23.github-sync/`.
 
@@ -55,7 +59,7 @@ The token lives in Textus's secret storage, on this computer only, and never rea
 
 - **Push after saving**: a few quiet seconds (5 by default, adjustable) after a save, then one commit for everything that changed meanwhile.
 - **Pull on a timer**: every 5 minutes by default, and only while there is nothing to push and no unanswered conflict — otherwise it fights itself.
-- **Sync now** in the panel follows the direction in settings (both ways, send only, receive only).
+- **Sync now** in the sidebar follows the direction on the settings page (both ways, send only, receive only).
 
 ## Limits
 

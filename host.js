@@ -58,6 +58,7 @@ const DEFAULT_RULES = [
 ].join("\n");
 
 const DEFAULTS = {
+  login: "", // the GitHub account the token belongs to, shown in Settings
   owner: "",
   repo: "",
   branch: "main",
@@ -571,7 +572,9 @@ class GitHubSync {
   constructor(ctx) {
     this.ctx = ctx;
     this.t = (key, ...args) => textus.l10n.t(key, ...args);
-    this.webview = null;
+    // The sidebar tab and the plugin's page in Settings are two webviews of
+    // the same document, so state arrives at both of them.
+    this.webviews = new Set();
     this.busy = false;
     this.abort = null;
     this.timer = null;
@@ -592,6 +595,7 @@ class GitHubSync {
       conflicts: [],
       tooLarge: [],
       excluded: 0,
+      firstChoice: null,
       progress: null,
       login: null,
       quota: null,
@@ -607,7 +611,11 @@ class GitHubSync {
       textus.commands.register(PLUGIN_ID + ".sync", () => this.run(DEFAULTS.mode)),
       textus.commands.register(PLUGIN_ID + ".push", () => this.run("push")),
       textus.commands.register(PLUGIN_ID + ".pull", () => this.run("pull")),
-      textus.views.registerWebview(VIEW_ID, { resolve: (webview) => this.resolve(webview) }),
+      textus.views.registerWebview(VIEW_ID, { resolve: (webview) => this.resolve(webview, "sidebar") }),
+      // The token, the repository and every strategy live on the plugin's
+      // own page in Settings: a tab, not the sidebar, so they can be found
+      // and changed before the first sync (and without a sync).
+      textus.views.registerSettingsPage({ resolve: (webview) => this.resolve(webview, "settings") }),
       textus.files.onDidSave(() => this.saved()),
       textus.files.onDidChangeRoot(() => this.refresh()),
     );
@@ -631,27 +639,40 @@ class GitHubSync {
     if (cache) this.cache = cache;
     this.state.configured = Boolean(this.config.owner && this.config.repo);
     this.state.last = this.config.last || null;
+    // Remembered so the Settings page can name the account without asking
+    // GitHub again; the token itself stays in the secrets store.
+    this.state.login = this.config.login || null;
   }
 
   async persist() {
     await this.ctx.storage.project.set("config", { ...this.config, last: this.state.last });
   }
 
-  resolve(webview) {
-    this.webview = webview;
+  resolve(webview, place) {
+    const where = place || "sidebar";
+    this.webviews.add(webview);
     this.ctx.plugin.readText("panel.html").then((html) => {
-      webview.html = html;
+      // One document, two pages: panel.js reads `data-place` and renders the
+      // sidebar or the Settings form. cloud-sync does the same.
+      webview.html = where === "settings" ? html.replace("<body>", '<body data-place="settings">') : html;
     });
     webview.onDidReceiveMessage((message) => this.receive(message));
-    webview.onDidDispose(() => {
-      if (this.webview === webview) this.webview = null;
-    });
+    webview.onDidDispose(() => this.webviews.delete(webview));
     this.broadcast();
-    if (this.state.configured && this.config.syncOnOpen) this.run(this.config.mode);
+    // Opening the Settings page is not a reason to sync; opening the sidebar
+    // is (when the setting says so).
+    if (where !== "settings" && this.state.configured && this.config.syncOnOpen) this.run(this.config.mode);
   }
 
   post(message) {
-    if (this.webview) this.webview.postMessage(message);
+    for (const webview of this.webviews) {
+      // A page can be gone by the time a long sync posts its last message.
+      try {
+        webview.postMessage(message);
+      } catch {
+        this.webviews.delete(webview);
+      }
+    }
   }
 
   broadcast() {
@@ -692,6 +713,14 @@ class GitHubSync {
     switch (message.type) {
       case "ready":
         this.broadcast();
+        return;
+      case "openSettings":
+        // Textus 1.3.13+: the plugin's own page in Settings, where the
+        // form below lives. The sidebar is only a status panel.
+        await textus.layout.openSettings();
+        return;
+      case "openTab":
+        await textus.layout.showSidebarTab(VIEW_ID);
         return;
       case "connect":
         await this.connect(String(message.token || "").trim());
@@ -782,6 +811,8 @@ class GitHubSync {
     const user = await api.whoAmI();
     this.state.connected = true;
     this.state.login = user.login;
+    this.config.login = user.login;
+    await this.persist();
     this.post({ type: "repos", repos: await this.listRepos() });
     if (this.state.configured) await this.firstConnection();
     else this.broadcast();
@@ -803,8 +834,14 @@ class GitHubSync {
     const differs = shared.filter((rel) => remote.get(rel).sha !== files.get(rel).sha);
     if (Object.keys(this.base.files).length === 0 && (differs.length > 0 || (shared.length > 0 && files.size !== remote.size))) {
       // Both sides hold files the plugin has never reconciled: asking costs
-      // one question, guessing wrongly costs the user's work.
-      this.post({ type: "firstChoice", local: files.size, remote: remote.size, shared: shared.length, differs: differs.length });
+      // one question, guessing wrongly costs the user's work. The question is
+      // asked in the sidebar, so it is opened when the repository was just
+      // bound from the Settings page.
+      await textus.layout.showSidebarTab(VIEW_ID);
+      // Kept in the state, not posted: the sidebar it just opened has not
+      // loaded its page yet and would miss a message.
+      this.state.firstChoice = { local: files.size, remote: remote.size, shared: shared.length, differs: differs.length };
+      this.broadcast();
       return;
     }
     await this.run(this.config.mode);
@@ -821,7 +858,7 @@ class GitHubSync {
     }
     this.busy = true;
     this.abort = new AbortController();
-    this.state = { ...this.state, busy: true, error: null, message: null, progress: null };
+    this.state = { ...this.state, busy: true, error: null, message: null, progress: null, firstChoice: null };
     this.broadcast();
     try {
       await this.sync(mode || this.config.mode);

@@ -43,3 +43,9 @@ test("every language it names is there, and so is every string it uses", () => {
     }
   }
 });
+test("the plugin has a page in Settings", () => {
+  // `contributes.settingsPage` is what puts the plugin in Settings; without
+  // it the token, the repository and the rules would only exist inside the
+  // sidebar tab, which is how the first version hid them.
+  assert.equal(typeof manifest.contributes?.settingsPage?.title, "string");
+});

@@ -7,42 +7,14 @@
     <script src="textus-resource:panel.js" defer></script>
   </head>
   <body>
+    <!-- The sidebar tab shows what the folder is doing and the buttons
+         that make it do it. Everything that can be changed lives on the
+         plugin's page in Settings (below), so there is one place to look
+         for the token, the repository, the rules and the strategy. -->
     <section id="setup">
       <h2 data-i18n="setup.title"></h2>
-      <div id="token-step">
-        <label for="token" data-i18n="setup.token"></label>
-        <input id="token" type="password" autocomplete="off" data-i18n-placeholder="setup.token.placeholder" />
-        <p class="hint" data-i18n="setup.token.hint"></p>
-        <button id="connect" class="primary" data-i18n="setup.connect"></button>
-      </div>
-
-      <div id="repo-step" hidden>
-        <p id="who" class="hint"></p>
-        <label for="repos" data-i18n="setup.repo"></label>
-        <select id="repos"></select>
-        <div class="row">
-          <input id="owner" data-i18n-placeholder="setup.owner.placeholder" />
-          <input id="repo" data-i18n-placeholder="setup.repo.placeholder" />
-        </div>
-        <label for="branch" data-i18n="setup.branch"></label>
-        <input id="branch" value="main" />
-
-        <div class="row">
-          <button id="finish" class="primary" data-i18n="setup.finish"></button>
-          <button id="create-toggle" data-i18n="setup.createRepo"></button>
-        </div>
-
-        <div id="create-box" hidden>
-          <input id="new-repo" data-i18n-placeholder="setup.repo.placeholder" />
-          <label class="check">
-            <input id="new-private" type="checkbox" checked />
-            <span data-i18n="setup.repo.private"></span>
-          </label>
-          <button id="create" class="primary" data-i18n="setup.create"></button>
-        </div>
-      </div>
-
-      <p id="setup-error" class="error"></p>
+      <p class="hint" data-i18n="setup.hint"></p>
+      <button class="open-settings primary" data-i18n="action.openSettings"></button>
     </section>
 
     <section id="first" hidden>
@@ -69,7 +41,6 @@
       <p id="main-error" class="error" hidden></p>
 
       <div class="row">
-        <input id="commit-message" data-i18n-placeholder="settings.commit.placeholder" />
         <button id="sync" class="primary" data-i18n="action.sync"></button>
         <button id="push" data-i18n="action.push"></button>
         <button id="pull" data-i18n="action.pull"></button>
@@ -81,69 +52,116 @@
         <ul id="conflict-list"></ul>
       </div>
 
-      <details id="settings">
-        <summary data-i18n="action.settings"></summary>
+      <div class="row">
+        <button class="open-settings" data-i18n="action.openSettings"></button>
+      </div>
+    </section>
 
+    <!-- The plugin's page in Settings (`contributes.settingsPage`). It is
+         a tab of its own, not the sidebar, so it is reachable before any
+         repository is chosen - which is where the older versions lost
+         people: their settings could only be seen after a sync. -->
+    <section id="settings-page" hidden>
+      <h2 data-i18n="page.title"></h2>
+
+      <h3 data-i18n="account.title"></h3>
+      <p id="who" class="hint"></p>
+      <div class="row">
+        <input id="token" type="password" autocomplete="off" data-i18n-placeholder="setup.token.placeholder" />
+        <button id="connect" class="primary" data-i18n="setup.connect"></button>
+      </div>
+      <p class="hint" data-i18n="setup.token.hint"></p>
+
+      <h3 data-i18n="repo.title"></h3>
+      <label for="repos" data-i18n="setup.repo.pick"></label>
+      <select id="repos"></select>
+      <div class="row">
+        <input id="owner" data-i18n-placeholder="setup.owner.placeholder" />
+        <input id="repo" data-i18n-placeholder="setup.repo.placeholder" />
+      </div>
+      <label for="branch" data-i18n="setup.branch"></label>
+      <input id="branch" value="main" />
+
+      <div class="row">
+        <button id="finish" class="primary" data-i18n="setup.finish"></button>
+        <button id="create-toggle" data-i18n="setup.createRepo"></button>
+      </div>
+
+      <div id="create-box" hidden>
+        <input id="new-repo" data-i18n-placeholder="setup.repo.placeholder" />
         <label class="check">
-          <input id="auto-push" type="checkbox" />
-          <span data-i18n="settings.autoPush"></span>
+          <input id="new-private" type="checkbox" checked />
+          <span data-i18n="setup.repo.private"></span>
         </label>
-        <p class="hint" data-i18n="settings.autoPush.hint"></p>
+        <button id="create" class="primary" data-i18n="setup.create"></button>
+      </div>
 
-        <label class="check">
-          <input id="auto-pull" type="checkbox" />
-          <span data-i18n="settings.autoPull"></span>
-        </label>
-        <p class="hint" data-i18n="settings.autoPull.hint"></p>
+      <h3 data-i18n="sync.title"></h3>
 
-        <label for="pull-minutes" data-i18n="settings.minutes"></label>
-        <input id="pull-minutes" type="number" min="1" max="1440" value="5" />
+      <label for="mode" data-i18n="settings.mode"></label>
+      <select id="mode">
+        <option value="merge" data-i18n="settings.mode.merge"></option>
+        <option value="push" data-i18n="settings.mode.push"></option>
+        <option value="pull" data-i18n="settings.mode.pull"></option>
+      </select>
 
-        <label for="settle-seconds" data-i18n="settings.settle"></label>
-        <p class="hint" data-i18n="settings.settle.hint"></p>
-        <input id="settle-seconds" type="number" min="1" max="120" value="5" />
+      <label class="check">
+        <input id="auto-push" type="checkbox" />
+        <span data-i18n="settings.autoPush"></span>
+      </label>
+      <p class="hint" data-i18n="settings.autoPush.hint"></p>
 
-        <label class="check">
-          <input id="sync-on-open" type="checkbox" />
-          <span data-i18n="settings.syncOnOpen"></span>
-        </label>
+      <label class="check">
+        <input id="auto-pull" type="checkbox" />
+        <span data-i18n="settings.autoPull"></span>
+      </label>
+      <p class="hint" data-i18n="settings.autoPull.hint"></p>
 
-        <label for="mode" data-i18n="settings.mode"></label>
-        <select id="mode">
-          <option value="merge" data-i18n="settings.mode.merge"></option>
-          <option value="push" data-i18n="settings.mode.push"></option>
-          <option value="pull" data-i18n="settings.mode.pull"></option>
-        </select>
+      <label for="pull-minutes" data-i18n="settings.minutes"></label>
+      <input id="pull-minutes" type="number" min="1" max="1440" value="5" />
 
-        <label for="on-remote-delete" data-i18n="settings.onRemoteDelete"></label>
-        <select id="on-remote-delete">
-          <option value="restore" data-i18n="settings.onRemoteDelete.restore"></option>
-          <option value="delete" data-i18n="settings.onRemoteDelete.delete"></option>
-        </select>
+      <label for="settle-seconds" data-i18n="settings.settle"></label>
+      <p class="hint" data-i18n="settings.settle.hint"></p>
+      <input id="settle-seconds" type="number" min="1" max="120" value="5" />
 
-        <label for="conflict-policy" data-i18n="settings.conflictPolicy"></label>
-        <select id="conflict-policy">
-          <option value="ask" data-i18n="settings.conflictpolicy.ask"></option>
-          <option value="local" data-i18n="settings.conflictpolicy.local"></option>
-          <option value="remote" data-i18n="settings.conflictpolicy.remote"></option>
-          <option value="both" data-i18n="settings.conflictpolicy.both"></option>
-        </select>
+      <label class="check">
+        <input id="sync-on-open" type="checkbox" />
+        <span data-i18n="settings.syncOnOpen"></span>
+      </label>
 
-        <label for="max-size" data-i18n="settings.maxSize"></label>
-        <p class="hint" data-i18n="settings.maxSize.hint"></p>
-        <input id="max-size" type="number" min="1" max="32" step="1" value="20" />
+      <label for="on-remote-delete" data-i18n="settings.onRemoteDelete"></label>
+      <select id="on-remote-delete">
+        <option value="restore" data-i18n="settings.onRemoteDelete.restore"></option>
+        <option value="delete" data-i18n="settings.onRemoteDelete.delete"></option>
+      </select>
 
-        <label for="rules" data-i18n="settings.rules"></label>
-        <p class="hint" data-i18n="settings.rules.hint"></p>
-        <textarea id="rules" rows="8" spellcheck="false"></textarea>
+      <label for="conflict-policy" data-i18n="settings.conflictPolicy"></label>
+      <select id="conflict-policy">
+        <option value="ask" data-i18n="settings.conflictpolicy.ask"></option>
+        <option value="local" data-i18n="settings.conflictpolicy.local"></option>
+        <option value="remote" data-i18n="settings.conflictpolicy.remote"></option>
+        <option value="both" data-i18n="settings.conflictpolicy.both"></option>
+      </select>
 
-        <p id="skipped" class="hint" hidden></p>
+      <label for="max-size" data-i18n="settings.maxSize"></label>
+      <p class="hint" data-i18n="settings.maxSize.hint"></p>
+      <input id="max-size" type="number" min="1" max="32" step="1" value="20" />
 
-        <div class="row">
-          <button id="save-settings" class="primary" data-i18n="action.saveSettings"></button>
-          <button id="disconnect" data-i18n="action.disconnect"></button>
-        </div>
-      </details>
+      <label for="rules" data-i18n="settings.rules"></label>
+      <p class="hint" data-i18n="settings.rules.hint"></p>
+      <textarea id="rules" rows="10" spellcheck="false"></textarea>
+
+      <label for="commit-message" data-i18n="settings.commit"></label>
+      <input id="commit-message" data-i18n-placeholder="settings.commit.placeholder" />
+
+      <p id="skipped" class="hint" hidden></p>
+      <p id="settings-error" class="error"></p>
+
+      <div class="row">
+        <button id="save-settings" class="primary" data-i18n="action.saveSettings"></button>
+        <button id="disconnect" data-i18n="action.disconnect"></button>
+        <button class="open-tab" data-i18n="action.openSync"></button>
+      </div>
     </section>
   </body>
 </html>

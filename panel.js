@@ -1,15 +1,20 @@
 // The panel is a plain page: one state object, one render call. Everything
 // it shows comes from host.js through `state` messages, so the UI never
 // decides what the sync should do - it only asks.
+//
+// One document serves both of the plugin's pages: the sidebar tab (status
+// and buttons) and its page in Settings (everything that can be changed).
+// host.js sets `data-place` on <body> when it loads the page, and each side
+// renders only the sections that exist there.
 (function () {
   "use strict";
 
   const api = acquireTextusApi();
   const byId = (id) => document.getElementById(id);
+  const place = document.body.dataset.place === "settings" ? "settings" : "sidebar";
 
   let state = null;
   let repos = [];
-  let connected = false;
 
   function t(key, ...args) {
     return api.t(key, ...args);
@@ -34,39 +39,51 @@
     }
   }
 
+  // A place has only its own elements: the sidebar has no form, the
+  // Settings page has no sync buttons. Nothing here may throw on the other
+  // page's ids.
+  function add(id, event, handler) {
+    const node = byId(id);
+    if (node) node.addEventListener(event, handler);
+  }
+
   function show(section) {
-    for (const id of ["setup", "first", "main"]) byId(id).hidden = id !== section;
+    for (const id of ["setup", "first", "main", "settings-page"]) {
+      const node = byId(id);
+      if (node) node.hidden = id !== section;
+    }
+  }
+
+  // A field waits for the user to leave it before it is written again, or
+  // a broadcast arriving while someone types would undo the edit.
+  function fill(id, value) {
+    const node = byId(id);
+    if (node && document.activeElement !== node) node.value = value;
   }
 
   function render() {
     if (!state) return;
-    // "configured" means owner + repo are known; until then the panel only
-    // asks for a token and a repository, in that order.
+    if (place === "settings") {
+      show("settings-page");
+      renderForm(state.config || {});
+      return;
+    }
+    // The first sync asks which side wins. The question travels in the
+    // state, so a sidebar opened for it after the ask still sees it.
+    if (state.firstChoice && byId("first-body")) {
+      const { local, remote, differs } = state.firstChoice;
+      byId("first-body").textContent = t("first.body", local, remote, differs);
+      show("first");
+      return;
+    }
+    // "configured" means owner + repo are known; until then the sidebar
+    // only points at the Settings page, where the token and the repository
+    // are chosen.
     show(state.configured ? "main" : "setup");
-    byId("token-step").hidden = state.connected;
-    byId("repo-step").hidden = !state.connected;
     if (state.configured) renderMain();
-    else renderSetup();
   }
 
-  function renderSetup() {
-    byId("setup-error").textContent = state.error || "";
-    byId("who").textContent = state.login ? t("state.connected", state.login) : "";
-    const select = byId("repos");
-    const current = select.value;
-    select.textContent = "";
-    const blank = document.createElement("option");
-    blank.value = "";
-    blank.textContent = t("setup.repo.pick");
-    select.append(blank);
-    for (const repo of repos) {
-      const option = document.createElement("option");
-      option.value = repo.fullName;
-      option.textContent = repo.fullName + (repo.private ? " " + t("setup.repo.privateTag") : "");
-      select.append(option);
-    }
-    if (current) select.value = current;
-  }
+  // --- sidebar ------------------------------------------------------------
 
   function renderMain() {
     const config = state.config || {};
@@ -93,7 +110,6 @@
     }
 
     renderConflicts();
-    renderSettings(config);
   }
 
   function renderConflicts() {
@@ -123,19 +139,45 @@
     }
   }
 
-  function renderSettings(config) {
+  // --- the plugin's page in Settings ---------------------------------------
+
+  function renderForm(config) {
+    byId("who").textContent = state.login ? t("state.account", state.login) : t("state.disconnected");
+
+    const select = byId("repos");
+    const current = select.value;
+    select.textContent = "";
+    const blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = t("setup.repo.pick");
+    select.append(blank);
+    for (const repo of repos) {
+      const option = document.createElement("option");
+      option.value = repo.fullName;
+      option.textContent = repo.fullName + (repo.private ? " " + t("setup.repo.privateTag") : "");
+      select.append(option);
+    }
+    select.value = current || (config.owner && config.repo ? config.owner + "/" + config.repo : "");
+
+    fill("owner", config.owner || "");
+    fill("repo", config.repo || "");
+    fill("branch", config.branch || "main");
+
+    byId("mode").value = config.mode || "merge";
     byId("auto-push").checked = Boolean(config.autoPush);
     byId("auto-pull").checked = Boolean(config.autoPull);
-    byId("pull-minutes").value = config.pullMinutes || 5;
-    byId("settle-seconds").value = config.settleSeconds || 5;
+    fill("pull-minutes", String(config.pullMinutes || 5));
+    fill("settle-seconds", String(config.settleSeconds || 5));
     byId("sync-on-open").checked = Boolean(config.syncOnOpen);
-    byId("mode").value = config.mode || "merge";
     byId("on-remote-delete").value = config.onRemoteDelete || "restore";
     byId("conflict-policy").value = config.conflictPolicy || "ask";
-    byId("max-size").value = Math.round((config.maxFileSize || 0) / (1024 * 1024)) || 20;
-    // Only replace the rules while the user is not typing in them, or the
-    // text jumps back to the saved version under the cursor.
-    if (document.activeElement !== byId("rules")) byId("rules").value = config.rules || "";
+    fill("max-size", String(Math.round((config.maxFileSize || 0) / (1024 * 1024)) || 20));
+    // The rules are the one field a broadcast must never touch mid-typing:
+    // the text would jump back to the saved version under the cursor.
+    fill("rules", config.rules || "");
+    fill("commit-message", config.commitMessage || "");
+
+    byId("settings-error").textContent = state.error || "";
 
     const skipped = byId("skipped");
     const large = state.tooLarge || [];
@@ -149,7 +191,7 @@
     skipped.textContent = lines.join("\n");
   }
 
-  // --- messages ----------------------------------------------------------
+  // --- messages ------------------------------------------------------------
 
   api.onDidReceiveMessage((message) => {
     if (!message || typeof message !== "object") return;
@@ -158,75 +200,78 @@
       render();
     } else if (message.type === "repos") {
       repos = message.repos || [];
-      renderSetup();
+      render();
     } else if (message.type === "created") {
       byId("new-repo").value = "";
       byId("create-box").hidden = true;
-      const [owner, repo] = String(message.fullName || "").split("/");
-      byId("owner").value = owner || "";
-      byId("repo").value = repo || "";
+      byId("owner").value = String(message.fullName || "").split("/")[0] || "";
+      byId("repo").value = String(message.fullName || "").split("/")[1] || "";
       api.postMessage({ type: "repos" });
-    } else if (message.type === "firstChoice") {
-      byId("first-body").textContent = t("first.body", message.local, message.remote, message.differs);
-      show("first");
-    } else if (message.type === "progress") {
+    } else if (message.type === "progress" && byId("progress")) {
       state = { ...state, progress: message.progress, busy: true };
       renderMain();
     }
   });
 
-  // --- setup ---------------------------------------------------------------
+  // --- the sidebar's buttons and the Settings page's form ------------------
 
-  byId("connect").onclick = () => {
+  for (const button of document.querySelectorAll(".open-settings")) {
+    button.onclick = () => api.postMessage({ type: "openSettings" });
+  }
+  for (const button of document.querySelectorAll(".open-tab")) {
+    button.onclick = () => api.postMessage({ type: "openTab" });
+  }
+
+  add("first-push", "click", () => api.postMessage({ type: "first", choice: "push" }));
+  add("first-pull", "click", () => api.postMessage({ type: "first", choice: "pull" }));
+
+  add("sync", "click", () =>
+    api.postMessage({ type: "sync", mode: (state && state.config && state.config.mode) || "merge" }),
+  );
+  add("push", "click", () => api.postMessage({ type: "sync", mode: "push" }));
+  add("pull", "click", () => api.postMessage({ type: "sync", mode: "pull" }));
+
+  add("connect", "click", () => {
     const token = byId("token").value.trim();
     if (!token) return;
-    byId("setup-error").textContent = "";
+    byId("settings-error").textContent = "";
     api.postMessage({ type: "connect", token });
-  };
+  });
 
-  byId("token").addEventListener("keydown", (event) => {
+  add("token", "keydown", (event) => {
     if (event.key === "Enter") byId("connect").click();
   });
 
-  byId("repos").onchange = () => {
+  add("repos", "change", () => {
     const value = byId("repos").value;
     if (!value) return;
     const [owner, repo] = value.split("/");
     byId("owner").value = owner;
     byId("repo").value = repo;
-  };
+  });
 
-  byId("create-toggle").onclick = () => {
+  add("create-toggle", "click", () => {
     const box = byId("create-box");
     box.hidden = !box.hidden;
-  };
+  });
 
-  byId("create").onclick = () => {
+  add("create", "click", () => {
     const name = byId("new-repo").value.trim();
     if (!name) return;
     api.postMessage({ type: "createRepo", name, private: byId("new-private").checked });
-  };
+  });
 
-  byId("finish").onclick = () => {
+  add("finish", "click", () => {
     const owner = byId("owner").value.trim();
     const repo = byId("repo").value.trim();
     if (!owner || !repo) {
-      byId("setup-error").textContent = t("error.repoMissing");
+      byId("settings-error").textContent = t("error.repoMissing");
       return;
     }
     api.postMessage({ type: "setup", owner, repo, branch: byId("branch").value.trim() || "main" });
-  };
+  });
 
-  byId("first-push").onclick = () => api.postMessage({ type: "first", choice: "push" });
-  byId("first-pull").onclick = () => api.postMessage({ type: "first", choice: "pull" });
-
-  // --- main ----------------------------------------------------------------
-
-  byId("sync").onclick = () => api.postMessage({ type: "sync", mode: byId("mode").value });
-  byId("push").onclick = () => api.postMessage({ type: "sync", mode: "push" });
-  byId("pull").onclick = () => api.postMessage({ type: "sync", mode: "pull" });
-
-  byId("save-settings").onclick = () => {
+  add("save-settings", "click", () => {
     api.postMessage({
       type: "settings",
       autoPush: byId("auto-push").checked,
@@ -241,12 +286,12 @@
       rules: byId("rules").value,
       commitMessage: byId("commit-message").value,
     });
-  };
+  });
 
-  byId("disconnect").onclick = () => {
+  add("disconnect", "click", () => {
     if (api.confirm && !api.confirm(t("action.disconnect.confirm"))) return;
     api.postMessage({ type: "disconnect" });
-  };
+  });
 
   // --- boot ----------------------------------------------------------------
 
